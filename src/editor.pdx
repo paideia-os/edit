@@ -1,0 +1,639 @@
+// src/editor.pdx — edit R71.M1-005 (edit#5)
+// Editor module: process entry point (_start) + the main REPL that
+// ties TtyRaw + Buffer + Render together, plus cursor-motion helpers.
+//
+// Scope (per edit#5's dispatch table)
+// ------------------------------------
+//   printable (0x20..0x7E)  -> buf_insert, cursor_pos += 1
+//   DEL (0x7F) / BS (0x08)  -> buf_delete of the byte before cursor
+//   CR (0x0D) / LF (0x0A)   -> buf_insert('\n'), cursor_pos += 1
+//   arrows (ESC [ A/B/C/D)  -> edit_cursor_move
+//   Ctrl+S (0x13)           -> save: sys_open+sys_write+sys_close
+//   Ctrl+O (0x0F)           -> load: buf_reset + reload from filename
+//   ESC alone (no `[`)      -> command mode, DEFERRED to edit#6 (no-op)
+//   Ctrl+Q (0x11)           -> quit (M1 addition — edit#6's colon
+//                              commands, including `:q`, are not in
+//                              this cohort, and ESC is deliberately a
+//                              no-op per the deferral above, so
+//                              without a Ctrl+Q binding the process
+//                              would have no way to exit and restore
+//                              the primary screen; edit_tty_raw_exit
+//                              is called before sys_exit to honour
+//                              edit#2's restore-on-exit contract)
+//
+// Filename handling (M1 scope decision — no ex-command line yet)
+// ----------------------------------------------------------------
+// `edit <path>` at argv[1] loads that file at startup (best-effort:
+// a missing file just starts with an empty buffer) and is the target
+// for both Ctrl+S (save) and Ctrl+O (reload-discarding-changes).
+// `edit` with no argument has no filename; Ctrl+S / Ctrl+O are then
+// no-ops. A `:w <path>` / `:e <path>` command line is edit#6 scope.
+//
+// Cursor motion simplification (M1 scope decision)
+// ---------------------------------------------------
+// Up/Down move to the START of the previous/next logical line (column
+// reset to 0) rather than preserving the visual column — a documented
+// simplification; column-preserving vertical motion is a natural
+// edit#6-or-later polish, not required by edit#5's plain "cursor
+// motion" wording.
+//
+// paideia-as compliance
+// ----------------------
+//   - Module name PascalCase basename (`Editor`), matches file stem.
+//   - argc/argv arrive in rdi/rsi at process entry (registers, not
+//     the stack) per design/user/execve-abi.md — same ABI cat/rm/mv
+//     rely on.
+//   - SC+ IDs: 0=read, 1=write, 2=open, 3=close, 60=exit (frozen
+//     table, src/user/syscall_shim.pdx, documented verbatim in
+//     cat/src/entry.pdx's own header).
+//   - `_start` is `@no_frame`: it never returns (ends in sys_exit or
+//     the quit path's sys_exit), so the SysV callee-save contract
+//     does not apply and rbx/r12-r15 are freely clobbered throughout
+//     — same posture as cat/rm/mv/true's own `_start`. A single
+//     `sub rsp, 8` at entry (execve delivers rsp%16==8, the post-CALL
+//     SysV state every `_start` in this tree assumes) covers every
+//     nested `call` site in this function at rsp%16==0, since no
+//     further push/sub ever changes rsp afterward.
+//   - Every OTHER function here that nests a `call` uses an odd-count
+//     push prologue (or a sub/add rsp,8 bracket) to land rsp%16==0 at
+//     its own call sites, and holds any state that must survive a
+//     nested call in a callee-save register (rbx/r12-r15) — never in
+//     rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11, all of which a callee may
+//     freely clobber under SysV.
+//   - No test rN,rN; no `and rN, imm64`; no 2-op imul; no neg; no
+//     sil/dil/bl aliases. Byte loads via `xor reg,reg; mov_b
+//     reg,[ptr]` (#1248), explicit `*1` SIB scale. Every `cmp reg,
+//     imm` immediate <= 4096, well under 0x7FFFFFFF.
+//   - Reserved-label discipline: every label prefixed `edit_` (per
+//     the module's own short name), with a per-function sub-prefix
+//     (`edit_ls_`, `edit_fwd_`, `edit_cm_`, `edit_crc_`, `elf_`,
+//     `esf_`) so internal labels never collide across functions and
+//     none collides with a paideia-as keyword (`loop`, `if`, ...).
+
+module Editor = structure {
+
+  pub let EDIT_VIEW_ROWS : u64 = 24
+
+  pub let mut cursor_pos : u64 = 0
+  pub let mut cursor_row : u64 = 0
+  pub let mut cursor_col : u64 = 0
+
+  pub let mut _edit_filename  : [u8; 256] = uninit @align(8)
+  pub let mut edit_filename_len : u64 = 0
+
+  pub let mut _edit_key_buf : [u8; 8]    = uninit @align(8)
+  pub let mut _edit_io_buf  : [u8; 4096] = uninit @align(8)
+
+  // ==========================================================================
+  // edit_line_start(pos) -> u64
+  // Scans backward from pos for the nearest preceding '\n'; returns
+  // the offset right after it (0 if none — pos is on the first
+  // line). Assumes the buffer is already normalized (contiguous
+  // content in [0, total_len)) by the caller. Leaf; caller-save only.
+  // ==========================================================================
+  pub let edit_line_start : (u64) -> u64 !{mem} @{} =
+    fn (pos: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#5 edit_line_start. Backward byte scan from pos looking for '\\n' (10); returns the offset immediately after the nearest one found, or 0 if the scan reaches the start of the buffer first (pos is already on the first logical line). Byte load via xor rax,rax + mov_b (#1248), explicit *1 SIB scale. Leaf: r8 (buf base), r9 (scan cursor / return value), rdx (probe index), rax (loaded byte) — all caller-save, no push/pop. Caller (edit_cursor_move) is responsible for having already normalized the buffer via buf_normalize. Labels prefixed edit_ls_.",
+      block: {
+        lea r8, [rip + _edit_buf];
+        mov r9, rdi;
+      edit_ls_loop:
+        cmp r9, 0;
+        je edit_ls_done;
+        mov rdx, r9;
+        sub rdx, 1;
+        xor rax, rax;
+        mov_b rax, [r8 + rdx*1];
+        cmp rax, 10;
+        je edit_ls_done;
+        mov r9, rdx;
+        jmp edit_ls_loop;
+      edit_ls_done:
+        mov rax, r9;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // edit_find_newline_fwd(pos) -> u64
+  // Scans forward from pos for the next '\n'; returns its offset, or
+  // total_len if none is found before the end of content. Assumes an
+  // already-normalized buffer. Leaf; caller-save only.
+  // ==========================================================================
+  pub let edit_find_newline_fwd : (u64) -> u64 !{mem} @{} =
+    fn (pos: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#5 edit_find_newline_fwd. Forward byte scan from pos for the next '\\n' (10); returns its offset, or total_len (loaded fresh at entry) if the scan reaches the end of content first. Same byte-load idiom and leaf register plan as edit_line_start. Labels prefixed edit_fwd_.",
+      block: {
+        lea r8, [rip + _edit_buf];
+        lea rcx, [rip + total_len];
+        mov r9, [rcx];
+        mov r10, rdi;
+      edit_fwd_loop:
+        cmp r10, r9;
+        jge edit_fwd_done;
+        xor rax, rax;
+        mov_b rax, [r8 + r10*1];
+        cmp rax, 10;
+        je edit_fwd_done;
+        add r10, 1;
+        jmp edit_fwd_loop;
+      edit_fwd_done:
+        mov rax, r10;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // edit_cursor_move(dir) -> ()
+  //   RDI: dir — 0=left, 1=right, 2=up, 3=down
+  // Updates cursor_pos in place. Left/right are plain +-1 clamped to
+  // [0, total_len]. Up/down jump to the start of the previous/next
+  // logical line (see the module header's column-reset note).
+  // ==========================================================================
+  pub let edit_cursor_move : (u64) -> () !{mem} @{} =
+    fn (dir: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#5 edit_cursor_move. 3-push prologue (rbx=dir, r12=cursor_pos, r13=total_len — all callee-save) lands rsp%16==0 at every nested call (buf_normalize up front to guarantee contiguous content; edit_line_start / edit_find_newline_fwd on the up/down arms), from the assumed entry rsp%16==8. Dispatches on dir via a cmp-chain (0=left: r12 -= 1 if > 0; 1=right: r12 += 1 if < total_len; 2=up: edit_line_start(r12) finds the current line's start — if that's already 0, the cursor is on line 0 and moves to offset 0; otherwise edit_line_start(that_start - 1) finds the PREVIOUS line's start, landing the cursor there; 3=down: edit_find_newline_fwd(r12) finds the next '\\n' at/after the cursor — if none exists (== total_len) the cursor goes to the very end, otherwise it lands one past that newline, i.e. the start of the next line). Writes the final r12 back to cursor_pos once at edit_cm_store. No test mnemonic; no AND/imul/neg. Labels prefixed edit_cm_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov rbx, rdi;
+
+        call buf_normalize;
+
+        lea rcx, [rip + cursor_pos];
+        mov r12, [rcx];
+        lea rcx, [rip + total_len];
+        mov r13, [rcx];
+
+        cmp rbx, 0;
+        je edit_cm_left;
+        cmp rbx, 1;
+        je edit_cm_right;
+        cmp rbx, 2;
+        je edit_cm_up;
+        jmp edit_cm_down;
+
+      edit_cm_left:
+        cmp r12, 0;
+        je edit_cm_store;
+        sub r12, 1;
+        jmp edit_cm_store;
+
+      edit_cm_right:
+        cmp r12, r13;
+        jge edit_cm_store;
+        add r12, 1;
+        jmp edit_cm_store;
+
+      edit_cm_up:
+        cmp r12, 0;
+        je edit_cm_store;
+        mov rdi, r12;
+        call edit_line_start;
+        cmp rax, 0;
+        je edit_cm_up_first;
+        mov rdi, rax;
+        sub rdi, 1;
+        call edit_line_start;
+        mov r12, rax;
+        jmp edit_cm_store;
+      edit_cm_up_first:
+        mov r12, rax;
+        jmp edit_cm_store;
+
+      edit_cm_down:
+        mov rdi, r12;
+        call edit_find_newline_fwd;
+        cmp rax, r13;
+        jge edit_cm_down_end;
+        add rax, 1;
+      edit_cm_down_end:
+        mov r12, rax;
+
+      edit_cm_store:
+        lea rcx, [rip + cursor_pos];
+        mov [rcx], r12;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // edit_compute_row_col() -> ()
+  // Recomputes cursor_row/cursor_col from cursor_pos by normalizing
+  // then counting '\n' bytes (row) and the distance since the last
+  // one (col) from offset 0 up to cursor_pos. O(cursor_pos); fine at
+  // the 64 KiB M0 cap.
+  // ==========================================================================
+  pub let edit_compute_row_col : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#5 edit_compute_row_col. sub rsp,8 / add rsp,8 brackets the single nested `call buf_normalize` (this function makes no push of its own, so the pad is what keeps that call site at rsp%16==0 from the assumed entry rsp%16==8). After the bracket, a plain forward scan from offset 0 to cursor_pos counts '\\n' bytes into rax (row) and resets a running column counter rcx to 0 on each one, else increments it; both are stored back to cursor_row/cursor_col once at edit_crc_done. Byte load via xor rdx,rdx + mov_b (#1248). No test mnemonic; no calls after the bracket, so rax/rcx/r8-r11 are free scratch for the remainder of the function. Labels prefixed edit_crc_.",
+      block: {
+        sub rsp, 8;
+        call buf_normalize;
+        add rsp, 8;
+
+        lea r8, [rip + _edit_buf];
+        lea rcx, [rip + cursor_pos];
+        mov r10, [rcx];
+        xor rax, rax;
+        xor rcx, rcx;
+        xor r11, r11;
+      edit_crc_loop:
+        cmp r11, r10;
+        jge edit_crc_done;
+        xor rdx, rdx;
+        mov_b rdx, [r8 + r11*1];
+        cmp rdx, 10;
+        jne edit_crc_not_nl;
+        add rax, 1;
+        xor rcx, rcx;
+        jmp edit_crc_next;
+      edit_crc_not_nl:
+        add rcx, 1;
+      edit_crc_next:
+        add r11, 1;
+        jmp edit_crc_loop;
+      edit_crc_done:
+        lea r9, [rip + cursor_row];
+        mov [r9], rax;
+        lea r9, [rip + cursor_col];
+        mov [r9], rcx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // edit_set_filename(src) -> ()
+  //   RDI: src — NUL-terminated path pointer (argv[1])
+  // Bounded copy (<= 255 bytes + NUL) into _edit_filename; sets
+  // edit_filename_len. Leaf; caller-save only.
+  // ==========================================================================
+  pub let edit_set_filename : (u64) -> () !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#5 edit_set_filename. Bounded byte-copy loop (cap 255, leaving room for the NUL in the 256-byte _edit_filename buffer) from src into _edit_filename, stopping early on the source's own NUL terminator; always NUL-terminates the destination at the final cursor and records that length in edit_filename_len. Byte load/store via xor rax,rax + mov_b (#1248), explicit *1 SIB scale. Leaf; only caller-save registers touched. Labels prefixed esf_.",
+      block: {
+        mov rsi, rdi;
+        lea rdi, [rip + _edit_filename];
+        xor rcx, rcx;
+      esf_loop:
+        cmp rcx, 255;
+        jge esf_done;
+        xor rax, rax;
+        mov_b rax, [rsi + rcx*1];
+        cmp rax, 0;
+        je esf_done;
+        mov_b [rdi + rcx*1], rax;
+        add rcx, 1;
+        jmp esf_loop;
+      esf_done:
+        mov_b [rdi + rcx*1], 0;
+        lea r8, [rip + edit_filename_len];
+        mov [r8], rcx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // edit_load_file() -> u64
+  // Best-effort load of _edit_filename into the buffer via
+  // sys_open(O_RDONLY) + chunked sys_read + buf_insert per byte +
+  // sys_close. Returns 0 on success, 1 if the open failed (caller
+  // treats either as "proceed with whatever the buffer now holds" —
+  // matches cat's own best-effort posture toward a missing file at
+  // this milestone). Caller is responsible for having already called
+  // buf_reset.
+  // ==========================================================================
+  pub let edit_load_file : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#5 edit_load_file. sys_open(_edit_filename, O_RDONLY=0, mode=0) — SC+ ID 2; rax<0 (missing file, permission, etc) returns 1 immediately, leaving the buffer as buf_reset left it (empty), matching cat's own missing-file-is-not-fatal posture at this milestone. On success: rbx=fd, r12=running insert position (starts at 0 since the caller already reset the buffer). Outer loop reads up to 4096 bytes per sys_read (SC+ ID 0) into _edit_io_buf; rax<=0 (EOF or error) ends the load. Inner loop calls buf_insert(r12, byte) once per byte read (r13=chunk byte count, callee-save, survives the buf_insert calls) and advances r12; buf_insert's own BUF_FULL return is ignored here exactly as insert failures are ignored from the interactive path (a load that hits the 64 KiB cap simply stops growing, ARM's fail-soft posture matching Buffer's own contract). sys_close (SC+ ID 3) on the way out, return ignored (best-effort, matches cat's own sys_close discipline). 3-push prologue (rbx=fd, r12=insert position, r13=chunk length — all callee-save) lands rsp%16==0 at the nested buf_insert call site from the assumed entry rsp%16==8. Labels prefixed elf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        lea rdi, [rip + _edit_filename];
+        xor rsi, rsi;
+        xor rdx, rdx;
+        mov rax, 2;
+        syscall;
+        cmp rax, 0;
+        jl elf_fail;
+
+        mov rbx, rax;
+        xor r12, r12;
+
+      elf_loop:
+        mov rdi, rbx;
+        lea rsi, [rip + _edit_io_buf];
+        mov rdx, 4096;
+        mov rax, 0;
+        syscall;
+        cmp rax, 0;
+        jle elf_done;
+        mov r13, rax;
+        xor rcx, rcx;
+
+      elf_byte_loop:
+        cmp rcx, r13;
+        jge elf_chunk_done;
+        lea rsi, [rip + _edit_io_buf];
+        xor rax, rax;
+        mov_b rax, [rsi + rcx*1];
+        mov rdi, r12;
+        mov rsi, rax;
+        call buf_insert;
+        add r12, 1;
+        add rcx, 1;
+        jmp elf_byte_loop;
+
+      elf_chunk_done:
+        jmp elf_loop;
+
+      elf_done:
+        mov rdi, rbx;
+        mov rax, 3;
+        syscall;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      elf_fail:
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _start — process entry point. Never returns.
+  //
+  // Sequence: buf_reset + render_reset (always start clean) ->
+  // if argc >= 2, copy argv[1] into _edit_filename and best-effort
+  // load it -> enter the alternate screen -> initial full paint +
+  // cursor placement -> REPL: read one keystroke, dispatch, redraw,
+  // reposition cursor, repeat. Ctrl+Q restores the primary screen and
+  // exits.
+  // ==========================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "edit#5 _start. (0) sub rsp,8 aligns rsp for every nested call in this function (execve delivers rsp%16==8 per this tree's `_start` convention; -8 yields 0 for SysV CALL; never restored since this function ends in sys_exit and is @no_frame). (1) mov r13,rdi (argc); mov r14,rsi (argv) per the frozen execve ABI. (2) call buf_reset; call render_reset — always start from a clean empty buffer with a full-repaint dirty bitmap. (3) cmp r13,2; jl edit_skip_filename — argc<2 means no positional path, skip straight to entering raw mode. (4) Otherwise: mov rdi,[r14+8] (argv[1]); call edit_set_filename; call edit_load_file (best-effort; a missing file just leaves the freshly-reset empty buffer in place). (5) edit_skip_filename: call edit_tty_raw_enter (ESC[?1049h); call render_frame (initial full paint, every line dirty from render_reset); call edit_compute_row_col; position the hardware cursor via tty_raw_cursor_to(cursor_row+1, cursor_col+1) (1-indexed). (6) edit_main_loop: sys_read(0, _edit_key_buf, 1) (SC+ ID 0); rax != 1 (no byte, or error) retries the same read rather than treating it as EOF — matches the tty0 backing's non-blocking-poll shape documented elsewhere in this tree (shell/src/line_reader.pdx), except here the block-and-retry happens inline rather than via sys_yield since edit has no scheduler-yield primitive wired in at M1. (7) Dispatch the one byte read (xor rax,rax + mov_b, #1248) via a cmp-chain: 0x11 (Ctrl+Q) -> edit_quit; 0x1B (ESC) -> edit_handle_esc (arrow-key FSM / deferred command mode, see below); 0x7F or 0x08 (DEL/BS) -> edit_handle_bs; 0x0D or 0x0A (CR/LF) -> edit_handle_enter; 0x13 (Ctrl+S) -> edit_handle_save; 0x0F (Ctrl+O) -> edit_handle_load; outside [0x20, 0x7E] and not otherwise matched -> ignored, straight to edit_after_dispatch; else falls through to the printable-insert path. (8) Printable: buf_insert(cursor_pos, byte); on BUF_OK, cursor_pos += 1, edit_compute_row_col, render_mark_dirty(cursor_row) (single-line change, no structural shift). (9) Enter: buf_insert(cursor_pos, 10); on BUF_OK, cursor_pos += 1, edit_compute_row_col, then mark EVERY line from the new cursor_row through VIEW_ROWS-1 (=23) dirty via edit_enter_mark_loop, since inserting a newline shifts every subsequent visible line's content down by one logical line. (10) Backspace/DEL: if cursor_pos==0, no-op; else del_pos=cursor_pos-1 (held in rbx, callee-save across the nested calls), buf_read(del_pos, _edit_key_buf, 1) peeks the byte about to be deleted (r12, callee-save, holds it across the following calls), buf_delete(del_pos, 1), cursor_pos=del_pos, edit_compute_row_col; if the deleted byte was '\\n' (r12==10) the same structural mark-every-subsequent-line loop as Enter runs (deleting a newline also shifts every later line up by one), else only cursor_row is marked dirty. (11) Ctrl+S: if edit_filename_len==0, no-op; else sys_open(_edit_filename, O_WRONLY|O_CREAT|O_TRUNC=0xC1, mode=0644=0x1A4) (SC+ ID 2), on success (fd in rbx) call buf_normalize then sys_write(fd, _edit_buf, total_len) (SC+ ID 1, cross-module direct field access — same convention cat/src/entry.pdx uses for cat_schema_id) and sys_close(fd) (SC+ ID 3); no dirty-marking needed (content and cursor are unchanged by a save). (12) Ctrl+O: if edit_filename_len==0, no-op; else buf_reset, edit_load_file (discarding all unsaved changes — no confirmation prompt, deferred to edit#6's command line), cursor_pos=0, render_reset (whole-buffer replace, every line dirty). (13) edit_handle_esc: reads one more byte (SC+ ID 0); if it isn't 0x5B ('[') this was a bare ESC — command mode, DEFERRED to edit#6, no-op (the extra consumed byte is a documented M1 approximation, see module header) — else reads a third byte and maps 'A'/'B'/'C'/'D' (0x41/0x42/0x43/0x44) to edit_cursor_move's up/down/right/left dir codes (2/3/1/0); any other third byte is an unrecognised CSI sequence, ignored. (14) edit_quit: call edit_tty_raw_exit (ESC[?1049l, edit#2's restore-on-exit contract) then sys_exit(0) (SC+ ID 60), never returns; defensive hlt for impossible fallthrough. (15) edit_after_dispatch (the shared tail every handler above falls through or jumps to): call render_frame (redraws whatever got marked dirty), call edit_compute_row_col, reposition the hardware cursor via tty_raw_cursor_to(cursor_row+1, cursor_col+1), jmp edit_main_loop. Every `cmp reg, imm` immediate here is a byte value, a small dir code, a fixed row/col bound (24), or a fixed open-flags/mode constant — all well under 0x7FFFFFFF. No test mnemonic. No 2-op imul. No neg. No sil/dil/bl. All labels prefixed edit_.",
+      block: {
+        sub rsp, 8;
+
+        mov r13, rdi;
+        mov r14, rsi;
+
+        call buf_reset;
+        call render_reset;
+
+        cmp r13, 2;
+        jl edit_skip_filename;
+
+        mov rdi, [r14 + 8];
+        call edit_set_filename;
+        call edit_load_file;
+
+      edit_skip_filename:
+        call edit_tty_raw_enter;
+        call render_frame;
+        call edit_compute_row_col;
+        lea rcx, [rip + cursor_row];
+        mov rdi, [rcx];
+        add rdi, 1;
+        lea rcx, [rip + cursor_col];
+        mov rsi, [rcx];
+        add rsi, 1;
+        call tty_raw_cursor_to;
+
+      edit_main_loop:
+        xor rdi, rdi;
+        lea rsi, [rip + _edit_key_buf];
+        mov rdx, 1;
+        xor rax, rax;
+        syscall;
+        cmp rax, 1;
+        jne edit_main_loop;
+
+        lea rcx, [rip + _edit_key_buf];
+        xor rax, rax;
+        mov_b rax, [rcx];
+
+        cmp rax, 0x11;
+        je edit_quit;
+        cmp rax, 0x1B;
+        je edit_handle_esc;
+        cmp rax, 0x7F;
+        je edit_handle_bs;
+        cmp rax, 0x08;
+        je edit_handle_bs;
+        cmp rax, 0x0D;
+        je edit_handle_enter;
+        cmp rax, 0x0A;
+        je edit_handle_enter;
+        cmp rax, 0x13;
+        je edit_handle_save;
+        cmp rax, 0x0F;
+        je edit_handle_load;
+        cmp rax, 0x20;
+        jl edit_after_dispatch;
+        cmp rax, 0x7E;
+        jg edit_after_dispatch;
+        jmp edit_handle_printable;
+
+      edit_handle_printable:
+        lea rcx, [rip + cursor_pos];
+        mov rdi, [rcx];
+        mov rsi, rax;
+        call buf_insert;
+        cmp rax, 0;
+        jne edit_after_dispatch;
+        lea rcx, [rip + cursor_pos];
+        mov rax, [rcx];
+        add rax, 1;
+        mov [rcx], rax;
+        call edit_compute_row_col;
+        lea rcx, [rip + cursor_row];
+        mov rdi, [rcx];
+        call render_mark_dirty;
+        jmp edit_after_dispatch;
+
+      edit_handle_enter:
+        lea rcx, [rip + cursor_pos];
+        mov rdi, [rcx];
+        mov rsi, 10;
+        call buf_insert;
+        cmp rax, 0;
+        jne edit_after_dispatch;
+        lea rcx, [rip + cursor_pos];
+        mov rax, [rcx];
+        add rax, 1;
+        mov [rcx], rax;
+        call edit_compute_row_col;
+        lea rcx, [rip + cursor_row];
+        mov rbx, [rcx];
+      edit_enter_mark_loop:
+        cmp rbx, 24;
+        jge edit_after_dispatch;
+        mov rdi, rbx;
+        call render_mark_dirty;
+        add rbx, 1;
+        jmp edit_enter_mark_loop;
+
+      edit_handle_bs:
+        lea rcx, [rip + cursor_pos];
+        mov r9, [rcx];
+        cmp r9, 0;
+        je edit_after_dispatch;
+        mov rbx, r9;
+        sub rbx, 1;
+        mov rdi, rbx;
+        lea rsi, [rip + _edit_key_buf];
+        mov rdx, 1;
+        call buf_read;
+        mov rdi, rbx;
+        mov rsi, 1;
+        call buf_delete;
+        lea rcx, [rip + cursor_pos];
+        mov [rcx], rbx;
+        lea rcx, [rip + _edit_key_buf];
+        xor r12, r12;
+        mov_b r12, [rcx];
+        call edit_compute_row_col;
+        cmp r12, 10;
+        jne edit_bs_single;
+        lea rcx, [rip + cursor_row];
+        mov rbx, [rcx];
+      edit_bs_mark_loop:
+        cmp rbx, 24;
+        jge edit_after_dispatch;
+        mov rdi, rbx;
+        call render_mark_dirty;
+        add rbx, 1;
+        jmp edit_bs_mark_loop;
+      edit_bs_single:
+        lea rcx, [rip + cursor_row];
+        mov rdi, [rcx];
+        call render_mark_dirty;
+        jmp edit_after_dispatch;
+
+      edit_handle_save:
+        lea rcx, [rip + edit_filename_len];
+        mov rax, [rcx];
+        cmp rax, 0;
+        je edit_after_dispatch;
+        lea rdi, [rip + _edit_filename];
+        mov rsi, 0xC1;
+        mov rdx, 0x1A4;
+        mov rax, 2;
+        syscall;
+        cmp rax, 0;
+        jl edit_after_dispatch;
+        mov rbx, rax;
+        call buf_normalize;
+        lea rsi, [rip + _edit_buf];
+        lea rcx, [rip + total_len];
+        mov rdx, [rcx];
+        mov rdi, rbx;
+        mov rax, 1;
+        syscall;
+        mov rdi, rbx;
+        mov rax, 3;
+        syscall;
+        jmp edit_after_dispatch;
+
+      edit_handle_load:
+        lea rcx, [rip + edit_filename_len];
+        mov rax, [rcx];
+        cmp rax, 0;
+        je edit_after_dispatch;
+        call buf_reset;
+        call edit_load_file;
+        lea rcx, [rip + cursor_pos];
+        xor rax, rax;
+        mov [rcx], rax;
+        call render_reset;
+        jmp edit_after_dispatch;
+
+      edit_handle_esc:
+        xor rdi, rdi;
+        lea rsi, [rip + _edit_key_buf];
+        mov rdx, 1;
+        xor rax, rax;
+        syscall;
+        cmp rax, 1;
+        jne edit_after_dispatch;
+        lea rcx, [rip + _edit_key_buf];
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0x5B;
+        jne edit_after_dispatch;
+        xor rdi, rdi;
+        lea rsi, [rip + _edit_key_buf];
+        mov rdx, 1;
+        xor rax, rax;
+        syscall;
+        cmp rax, 1;
+        jne edit_after_dispatch;
+        lea rcx, [rip + _edit_key_buf];
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0x41;
+        jne edit_esc_check_b;
+        mov rdi, 2;
+        jmp edit_esc_move;
+      edit_esc_check_b:
+        cmp rax, 0x42;
+        jne edit_esc_check_c;
+        mov rdi, 3;
+        jmp edit_esc_move;
+      edit_esc_check_c:
+        cmp rax, 0x43;
+        jne edit_esc_check_d;
+        mov rdi, 1;
+        jmp edit_esc_move;
+      edit_esc_check_d:
+        cmp rax, 0x44;
+        jne edit_after_dispatch;
+        mov rdi, 0;
+      edit_esc_move:
+        call edit_cursor_move;
+        jmp edit_after_dispatch;
+
+      edit_quit:
+        call edit_tty_raw_exit;
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      edit_after_dispatch:
+        call render_frame;
+        call edit_compute_row_col;
+        lea rcx, [rip + cursor_row];
+        mov rdi, [rcx];
+        add rdi, 1;
+        lea rcx, [rip + cursor_col];
+        mov rsi, [rcx];
+        add rsi, 1;
+        call tty_raw_cursor_to;
+        jmp edit_main_loop;
+      }
+    }
+
+}

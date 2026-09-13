@@ -1,0 +1,73 @@
+# edit — caps.decl
+#
+# Wave: R71.M1-001 (edit#1), bootstrap.
+# Doc:  design/roadmap/post-r60-daily-use-roadmap.md §"R71 -- vi-like
+#       TUI editor `edit`" in paideia-os.
+#
+# Purpose
+# -------
+# This file is the invariant-I6 (capability handoff visible +
+# refusable) manifest the shell validates at exec: edit receives
+# exactly the caps below and no more. Missing a required cap in the
+# reconciled set is an exec refusal; extra caps in the received set
+# are dropped at cap_manifest_verify (libpdx-cap M2-001) before
+# edit's `_start` observes them. This is the R71.M1 bootstrap shape
+# — the minimum surface edit#1..edit#5 need — not yet reconciled
+# against the R90-XREPO adoption wave the more mature coreutil repos
+# (cat, rm, mv, mkdir) have already gone through; that reconciliation
+# is future work once edit reaches a comparable milestone.
+#
+# requires:
+#
+#   KIND_USER
+#     Identity root. No direct use at R71.M1 (no per-user audit trail
+#     yet); declared per this org's baseline convention (every
+#     shipping tool declares KIND_USER even before it has a concrete
+#     consumer) so a future audit/undo integration does not need a
+#     caps.decl edit to add it.
+#
+#   KIND_TTY (write)
+#     Every byte edit writes goes to fd 1 as a raw ANSI/CSI sequence
+#     via plain sys_write (TtyRaw::edit_tty_raw_enter/exit,
+#     tty_raw_cursor_to, tty_raw_erase_line; Render::render_frame's
+#     content writes). No KIND_TTY(read) is declared here: edit#2's
+#     scope is alt-screen + cursor addressing over ordinary fd-1
+#     writes, NOT the ICANON/ECHO raw-mode toggle that would require
+#     a KIND_TTY row + TTY_OP_SET_RAW cap_invoke -- that substrate
+#     gap is still open even for shell's own line editor (see
+#     shell/src/line_reader.pdx's lr_tty_set_raw / lr_tty_set_cooked,
+#     both scaffolded no-ops) and is out of scope for this cohort.
+#     Keystroke input (Editor::_start's edit_main_loop) reads fd 0
+#     via the ordinary sys_read SC+ ID, not a capability-gated path.
+#
+#   KIND_PDXFS_FILE (read, <arg-path>)
+#   KIND_PDXFS_FILE (write, <arg-path>)
+#     File open+read (initial load from argv[1], Ctrl+O reload) and
+#     open+write (Ctrl+S save), both scoped to the single path passed
+#     on argv or set via Ctrl+O/Ctrl+S at runtime (M1 has no `:e`/`:w`
+#     ex-command to retarget a different path -- that lands at edit#6
+#     and would widen this to an argv-narrowed <arg-path> pattern
+#     matching cat/cp's own per-argument narrowing convention).
+#
+#   KIND_IPC_ENDPOINT
+#     Reserved for a future semantic-pipe emission (an EditRecord@0.1
+#     on save, mirroring cat's CatPipeRecord@0.1 / cp's CopyRecord
+#     @0.1 precedent) and/or a future libpdx-audit hook on save.
+#     Declared now, not yet invoked -- same DECLARED-but-not-INVOKED
+#     posture rm#28's KIND_PDXFS_VOL row documents (the manifest
+#     reconciler treats a declared-but-unused cap as informational,
+#     not CAP_MANIFEST_EXTRA).
+#
+# Missing caps in the received set -> exit path TBD (edit has no
+# errno-mapped diagnostic layer yet at R71.M1; that is future polish
+# alongside the ex-command line at edit#6).
+
+requires:
+  - KIND_USER
+  - KIND_TTY (write)
+  - KIND_PDXFS_FILE (read, <arg-path>)
+  - KIND_PDXFS_FILE (write, <arg-path>)
+  - KIND_IPC_ENDPOINT
+
+# No declared output schemas at R71.M1 -- the semantic-pipe emission
+# noted above is reserved, not yet wired.

@@ -1,0 +1,282 @@
+// src/render.pdx — edit R71.M1-004 (edit#4)
+// Render module: viewport walker over Buffer's content, redrawing
+// only dirty lines. M1 scope: fixed viewport, no scrolling — top_line
+// is always 0, so "line N" and "terminal row N" (0-indexed) coincide
+// for the VIEW_ROWS visible rows. Files longer than VIEW_ROWS lines
+// simply show their first VIEW_ROWS lines; scrolling is out of scope
+// for R71.M1 (not asked for by edit#4 / edit#5) and is left to a
+// later milestone.
+//
+// Public surface (per edit#4)
+// ----------------------------
+//   _dirty_lines : [u64; 64]     .bss bitmap, 64 words * 64 bits =
+//                                 4096 addressable line slots (far
+//                                 above VIEW_ROWS; defensive margin).
+//   render_reset()          -> () mark every tracked line dirty (used
+//                                 at startup and after a full-buffer
+//                                 replace, e.g. Ctrl+O reload).
+//   render_mark_dirty(line) -> () set one line's dirty bit.
+//   render_is_dirty(line)   -> u64 0/1.
+//   render_clear_dirty(line)-> () clear one line's dirty bit (called
+//                                 only once render_frame has just
+//                                 redrawn that line, so the bit is
+//                                 known set — no re-check needed).
+//   render_frame()          -> () walk rows 0..VIEW_ROWS-1; for each
+//                                 dirty row, emit CSI cursor-to-row +
+//                                 CSI erase-line + the line's content
+//                                 bytes (clamped to VIEW_COLS), then
+//                                 clear its dirty bit.
+//
+// Bit-index math avoids AND-with-immediate on principle (this tree's
+// convention — see libpdx-argv/schema_emit.pdx's align-up-without-AND
+// note and elevate_request.pdx's `mov r10,0xFF; and rax,r10` trick):
+// every mask/index computation here loads the small constant (63, or
+// 1) into a scratch register first and ANDs register-against-register.
+//
+// paideia-as compliance
+// ----------------------
+//   - Module name PascalCase basename (`Render`), matches file stem.
+//   - No test rN,rN; no `and rN, imm64` (only register-register AND,
+//     e.g. `mov r9,63; and rcx,r9`); no 2-op imul; no neg; no
+//     sil/dil/bl.
+//   - Variable-count shift uses `cl` (shl reg, cl / shr reg, cl) —
+//     the ISA-mandated shift-count register, distinct from the
+//     banned sil/dil/bl byte-operand aliases.
+//   - Byte loads via `xor rax,rax; mov_b rax,[ptr]` (#1248), explicit
+//     `*1` SIB scale; u64 array indexing uses `*8` SIB scale (a
+//     scale factor, not an alias — no precedent forbids it, and
+//     stores like `mov [r8+rcx*8], rax` write a full 8-byte value
+//     unambiguously sized by the rax operand).
+//   - Every `cmp reg, imm` immediate <= 65536, well under 0x7FFFFFFF.
+//   - Reserved-label discipline: every label prefixed `rmd_` / `rcd_`
+//     / `rid_` / `rr_` / `rend_` (module short-name `rend`, avoiding
+//     collision with the `render_` function-name prefix itself so
+//     internal labels are visually distinct from public symbols).
+//   - render_frame's odd 3-push prologue (rbx, r12, r13) keeps
+//     rsp%16==0 at every nested call (buf_normalize, render_is_dirty,
+//     tty_raw_cursor_to, tty_raw_erase_line, render_clear_dirty).
+
+module Render = structure {
+
+  pub let VIEW_ROWS : u64 = 24
+  pub let VIEW_COLS : u64 = 80
+  pub let DIRTY_MAX_LINES : u64 = 4096
+
+  pub let mut _dirty_lines : [u64; 64] = uninit @align(8)
+
+  // ==========================================================================
+  // render_reset() -> ()
+  // Marks every one of the 4096 tracked line slots dirty (all-ones in
+  // every word), forcing a full repaint on the next render_frame.
+  // Used at startup and after any whole-buffer replace (Ctrl+O
+  // reload). Leaf; no calls.
+  // ==========================================================================
+  pub let render_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#4 render_reset. Fills all 64 words of _dirty_lines with 0xFFFFFFFFFFFFFFFF (mov rax,-1 sign-extends to all-ones in 64-bit context — no movabs needed) via a 64-iteration store loop, `mov [r8+rcx*8], rax`. Leaf: rax/rcx/r8 only (all caller-save), no push/pop. No test mnemonic (cmp rcx,64 loop bound).",
+      block: {
+        lea r8, [rip + _dirty_lines];
+        mov rax, -1;
+        xor rcx, rcx;
+      rr_loop:
+        cmp rcx, 64;
+        jge rr_done;
+        mov [r8 + rcx*8], rax;
+        add rcx, 1;
+        jmp rr_loop;
+      rr_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // render_mark_dirty(line) -> ()
+  //   RDI: line — 0-indexed line number; silently ignored if >= 4096.
+  // ==========================================================================
+  pub let render_mark_dirty : (u64) -> () !{mem} @{} =
+    fn (line: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#4 render_mark_dirty. word_idx = line >> 6 (shr); bit_idx = line & 63 via `mov r9,63; and rcx,r9` (register-register AND, sidesteps this tree's AND-with-immediate avoidance convention); mask = 1 << bit_idx via `shl r10, cl` (cl = low byte of rcx = bit_idx, the ISA-mandated variable-shift-count register — distinct from the banned sil/dil/bl operand aliases); ORs the mask into _dirty_lines[word_idx]. Out-of-range line (>= DIRTY_MAX_LINES = 4096) returns immediately as a defensive no-op — never hit in practice since Editor only marks lines in [0, VIEW_ROWS). Leaf; no calls; only caller-save registers touched. Labels prefixed rmd_.",
+      block: {
+        cmp rdi, 4096;
+        jl rmd_ok;
+        ret;
+      rmd_ok:
+        mov rax, rdi;
+        shr rax, 6;
+        mov rcx, rdi;
+        mov r9, 63;
+        and rcx, r9;
+        mov r10, 1;
+        shl r10, cl;
+        lea r8, [rip + _dirty_lines];
+        mov r11, [r8 + rax*8];
+        or r11, r10;
+        mov [r8 + rax*8], r11;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // render_clear_dirty(line) -> ()
+  // Called only immediately after render_frame has redrawn `line`, so
+  // its dirty bit is known set — clearing it via subtraction (word -
+  // mask, valid exactly because bit is known 1) avoids needing a NOT
+  // instruction (unused anywhere in this codebase) or an AND-with-
+  // complement.
+  // ==========================================================================
+  pub let render_clear_dirty : (u64) -> () !{mem} @{} =
+    fn (line: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#4 render_clear_dirty. Same word_idx/bit_idx/mask computation as render_mark_dirty, then `sub r11, r10` clears the bit — valid without a NOT instruction because every call site (render_frame's rend_clear_bit) only reaches this function for a line it just confirmed dirty via render_is_dirty, so the targeted bit is guaranteed 1 and subtracting its power-of-two value cannot borrow into neighbouring bits. Leaf; no calls. Labels prefixed rcd_.",
+      block: {
+        cmp rdi, 4096;
+        jl rcd_ok;
+        ret;
+      rcd_ok:
+        mov rax, rdi;
+        shr rax, 6;
+        mov rcx, rdi;
+        mov r9, 63;
+        and rcx, r9;
+        mov r10, 1;
+        shl r10, cl;
+        lea r8, [rip + _dirty_lines];
+        mov r11, [r8 + rax*8];
+        sub r11, r10;
+        mov [r8 + rax*8], r11;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // render_is_dirty(line) -> u64
+  //   RAX: 0 or 1. Out-of-range line reads as clean (0).
+  // ==========================================================================
+  pub let render_is_dirty : (u64) -> u64 !{mem} @{} =
+    fn (line: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#4 render_is_dirty. word_idx/bit_idx as above; `shr r10, cl` brings the target bit to position 0, then `mov r11,1; and r10,r11` (register-register AND) isolates it. Leaf; no calls; only caller-save registers touched. Labels prefixed rid_.",
+      block: {
+        cmp rdi, 4096;
+        jl rid_ok;
+        xor rax, rax;
+        ret;
+      rid_ok:
+        mov rax, rdi;
+        shr rax, 6;
+        mov rcx, rdi;
+        mov r9, 63;
+        and rcx, r9;
+        lea r8, [rip + _dirty_lines];
+        mov r10, [r8 + rax*8];
+        shr r10, cl;
+        mov r11, 1;
+        and r10, r11;
+        mov rax, r10;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // render_frame() -> ()
+  // Viewport walker: for each of the VIEW_ROWS visible rows (top_line
+  // is always 0 at R71.M1), if that line's dirty bit is set, find its
+  // byte range in the normalized buffer, position the cursor, erase
+  // the line, write its (VIEW_COLS-clamped) content, and clear the
+  // dirty bit.
+  // ==========================================================================
+  pub let render_frame : () -> () !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#4 render_frame. (0) call buf_normalize so Buffer::_edit_buf[0..total_len) is contiguous. (1) rbx = row = 0; loop while row < VIEW_ROWS=24. (2) call render_is_dirty(row); skip to rend_row_next if clean. (3) Dirty: scan _edit_buf from offset 0 counting '\\n' bytes until either `row` newlines have been passed (rend_find_start) — r12 = that byte offset, the start of logical line `row` — or the scan runs off total_len first (fewer lines in the file than `row`; r12 lands at total_len, i.e. an empty line past EOF). (4) From r12, scan forward for the next '\\n' or total_len (rend_find_end); display length = min(end - start, VIEW_COLS=80), stashed in r13 (callee-save — must survive the two upcoming calls). (5) call tty_raw_cursor_to(row+1, 1) — 1-indexed. (6) call tty_raw_erase_line(). (7) If r13 > 0, sys_write(1, _edit_buf + r12, r13) directly (re-deriving the source pointer fresh via lea+add rather than trusting a stale r8/r9, both of which are caller-save and could have been clobbered by steps 5-6). (8) call render_clear_dirty(row). (9) row += 1, loop. 3-push prologue (rbx=row, r12=line_start, r13=display_len — all callee-save, none of which render_is_dirty / tty_raw_cursor_to / tty_raw_erase_line / render_clear_dirty touch by their own leaf-register-plan design, so they survive every nested call untouched with no reload needed except where a call could plausibly have clobbered a caller-save scratch register the next step needs, which step (7)'s fresh lea handles explicitly) lands rsp%16==0 at every one of those five call sites from the assumed entry rsp%16==8. No test mnemonic anywhere; no AND-with-immediate; no 2-op imul; no neg. Labels prefixed rend_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        call buf_normalize;
+
+        xor rbx, rbx;
+      rend_row_loop:
+        cmp rbx, 24;
+        jge rend_row_done;
+
+        mov rdi, rbx;
+        call render_is_dirty;
+        cmp rax, 0;
+        je rend_row_next;
+
+        lea r8, [rip + _edit_buf];
+        lea rcx, [rip + total_len];
+        mov r9, [rcx];
+        xor r10, r10;
+        xor r11, r11;
+      rend_find_start:
+        cmp r11, rbx;
+        jge rend_start_found;
+        cmp r10, r9;
+        jge rend_start_found;
+        xor rax, rax;
+        mov_b rax, [r8 + r10*1];
+        add r10, 1;
+        cmp rax, 10;
+        jne rend_find_start;
+        add r11, 1;
+        jmp rend_find_start;
+      rend_start_found:
+        mov r12, r10;
+
+        mov r10, r12;
+      rend_find_end:
+        cmp r10, r9;
+        jge rend_end_found;
+        xor rax, rax;
+        mov_b rax, [r8 + r10*1];
+        cmp rax, 10;
+        je rend_end_found;
+        add r10, 1;
+        jmp rend_find_end;
+      rend_end_found:
+        mov rax, r10;
+        sub rax, r12;
+        cmp rax, 80;
+        jle rend_len_ok;
+        mov rax, 80;
+      rend_len_ok:
+        mov r13, rax;
+
+        mov rdi, rbx;
+        add rdi, 1;
+        mov rsi, 1;
+        call tty_raw_cursor_to;
+
+        call tty_raw_erase_line;
+
+        cmp r13, 0;
+        je rend_clear_bit;
+        lea rsi, [rip + _edit_buf];
+        add rsi, r12;
+        mov rdx, r13;
+        mov rdi, 1;
+        mov rax, 1;
+        syscall;
+
+      rend_clear_bit:
+        mov rdi, rbx;
+        call render_clear_dirty;
+
+      rend_row_next:
+        add rbx, 1;
+        jmp rend_row_loop;
+
+      rend_row_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

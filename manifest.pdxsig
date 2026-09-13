@@ -1,0 +1,107 @@
+# edit — manifest.pdxsig
+#
+# Dual-signed package manifest for `edit` v0.5.0 (R71.M1 close).
+#
+# Substrate posture (same as every other paideia-os/* repo's manifest
+# at this writing — see cat/rm's own manifest.pdxsig headers)
+# ---------------------------------------------------------------
+# The ML-DSA-65 signing substrate (paideia-as's ml_dsa_65_{sign,verify}
+# intrinsic + the svc.signing-bot broker + the pkgs.paideia-os package
+# host) is not live anywhere in the org yet. Both `signature_ml_dsa_65:`
+# fields below carry the literal string `PENDING`. `content_hashes`
+# below uses sha2-256 (computed with `sha256sum` over this v0.5.0 tree)
+# as an interim integrity witness; the eventual `paideia-as release
+# --sign` re-emit will add the sha3-256 on-wire form alongside real
+# signatures.
+
+# ---------------------------------------------------------------
+# §1 Package identity
+# ---------------------------------------------------------------
+package:
+  name:              edit
+  version:           0.5.0
+  wave:              R71.M1 (Wave KK — edit#1, edit#2, edit#3, edit#4, edit#5)
+  category:          C  # Daily-use TUI tools (post-r60-daily-use-roadmap.md)
+  posix_ancestor:    vi
+  release_date:      2026-09-13
+  git_tag:           v0.5.0
+  git_repo:          github.com/paideia-os/edit
+  license:           MIT
+  paideia_as_target: v0.21.0        # tools/build.sh minimum
+
+# ---------------------------------------------------------------
+# §2 Capability manifest reference (I6)
+# ---------------------------------------------------------------
+caps_decl:
+  path:              caps.decl
+  hash_sha2_256:     5bce6bd9ecbddecfa0939c275113388ad76bc2f07a88f905d5e3ddc85333b5a8
+
+# ---------------------------------------------------------------
+# §3 Dependency manifest reference
+# ---------------------------------------------------------------
+# No deps.list at R71.M1 -- edit has no third-party library
+# dependencies (no libpdx-argv, no libpdx-audit) yet.
+deps_list:
+  path:              (none)
+
+# ---------------------------------------------------------------
+# §4 Content hashes over the shipped tree
+# ---------------------------------------------------------------
+content_hashes:
+  algorithm:         sha2-256          # interim; on-wire will use sha3-256
+  entries:
+    - path: LICENSE
+      hash: 591a905545b6356cda3757e07ad6a9ec15e545b6e6b1e3cdd2c529dd666401f8
+    - path: README.md
+      hash: b0ed2bea3763264efa89413183ba9320400f8660540070c37f9dc16bd0919654
+    - path: CHANGELOG.md
+      hash: 73bb77018e35ed741006007dc31ad09e13fd242e251921322d78cc61e317fddb
+    - path: caps.decl
+      hash: 5bce6bd9ecbddecfa0939c275113388ad76bc2f07a88f905d5e3ddc85333b5a8
+    - path: tools/build.sh
+      hash: 61a5b2717130e20ca1a329e6dcf991a1d6f5e72a54771aa9c3ffc09336c5499f
+    - path: src/tty_raw.pdx
+      hash: 7bad880e4146fc1b729efa737f954de204a6a4e4fbe620d8b4816efc94f3bacc
+    - path: src/buffer.pdx
+      hash: 04d3e532a3463f46fdb113d8f47893de971e34ce704b585635d423c44ef2b104
+    - path: src/render.pdx
+      hash: 6768b0c874774c0f721f9315ec5f10abedb0cae21007cf12197307913c101333
+    - path: src/editor.pdx
+      hash: b97b0f29cdeda2371ddd4f346a6e5467279a8e53be56ee068bd172633cd976fa
+    - path: src/edit.ld
+      hash: adefb1fd81461639b1cd9dc3432562660b99efa2fe80590961631e9fa2357d3c
+
+# ---------------------------------------------------------------
+# §5 Declared output schemas
+# ---------------------------------------------------------------
+# None at R71.M1 -- caps.decl reserves KIND_IPC_ENDPOINT for a future
+# EditRecord@0.1 semantic-pipe emission on save; not wired yet.
+declared_output_schemas: []
+
+# ---------------------------------------------------------------
+# §6 Author signature — first of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+author_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia-os-team
+  signer_pk_id:      PENDING
+  signature_ml_dsa_65: PENDING
+
+# ---------------------------------------------------------------
+# §7 Root re-signature — second of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+root_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia_root_pk
+  signer_pk_id:      PENDING
+  signature_ml_dsa_65: PENDING
+  countersigned_by:  svc.signing-bot
+  countersigner_note: pending
+
+# ---------------------------------------------------------------
+# §8 Substrate-gate refusal witness
+# ---------------------------------------------------------------
+# `pkg install edit` from this manifest MUST refuse until both
+# signature blocks carry non-PENDING bytes (invariant I4, cap denied,
+# exit code 4) -- same posture as every other paideia-os/* manifest
+# at this writing.

@@ -1,0 +1,345 @@
+// src/buffer.pdx — edit R71.M1-003 (edit#3)
+// Buffer module: gap buffer over a fixed 65536-byte (64 KiB) backing
+// array. M0 scope per the R71 roadmap: single small-file cap, no
+// piece-table, no multi-buffer.
+//
+// Layout
+// ------
+//   _edit_buf[0 .. gap_start)   -- logical content, prefix
+//   _edit_buf[gap_start .. gap_end) -- the gap (unused slack)
+//   _edit_buf[gap_end .. 65536) -- logical content, suffix
+//   total_len = 65536 - (gap_end - gap_start) = logical byte count
+//
+// A fresh buffer (buf_reset) is one big gap: gap_start=0,
+// gap_end=65536, total_len=0.
+//
+// Public surface (per edit#3)
+// ----------------------------
+//   buf_reset()                 -> ()   init to empty
+//   buf_normalize()             -> ()   push the gap to the end, so
+//                                        _edit_buf[0..total_len) is
+//                                        contiguous logical content.
+//                                        Used by buf_read and by any
+//                                        caller (Render, Editor) that
+//                                        needs to scan raw bytes.
+//   buf_move_gap(pos)           -> ()   internal primitive; moves the
+//                                        gap so gap_start == pos.
+//   buf_insert(pos, byte)       -> u64  0 = OK, 1 = BUF_FULL (gap
+//                                        exhausted at the 64 KiB cap)
+//   buf_delete(pos, count)      -> u64  0 = OK; count is clamped to
+//                                        the bytes actually available
+//   buf_read(pos, out, count)   -> u64  bytes actually copied
+//                                        (clamped); normalizes first
+//
+// paideia-as compliance (feedback_pdx_encoder_pitfalls)
+// -------------------------------------------------------
+//   - Module name PascalCase basename (`Buffer`), matches file stem.
+//   - No `test rN,rN`; every zero-check is `cmp reg, 0`.
+//   - No `and rN, imm64` on r8-r15 (no AND-with-immediate at all in
+//     this file — the gap-move/insert/delete/read logic needs no
+//     bitmasking).
+//   - No 2-op `imul`, no `neg`, no `sil`/`dil`/`bl` byte aliases.
+//   - Byte loads/stores via `xor rax,rax; mov_b rax,[ptr]` / `mov_b
+//     [ptr], reg64` (#1248 mitigation) with explicit `*1` SIB scale.
+//   - Every `cmp reg, imm` immediate <= 65536, well under 0x7FFFFFFF.
+//   - Reserved-label discipline: every label prefixed `buf_` (or a
+//     sub-prefix `buf_mg_` / `buf_in_` / `buf_de_` / `buf_rd_`) so no
+//     bare `loop`/`if`/`done` collides with paideia-as keywords.
+//   - Every function that makes a nested `call` preserves rsp%16==0
+//     at the call site via an odd-count push prologue (buf_insert/
+//     buf_delete: 1 push = rbx; buf_read: 3 pushes = rbx,r12,r13;
+//     buf_normalize: sub rsp,8 / add rsp,8 bracket, mirroring the
+//     div-by-10-print family's stack-pad idiom).
+
+module Buffer = structure {
+
+  // ==========================================================================
+  // Backing store — 64 KiB gap buffer + 3 state words.
+  // ==========================================================================
+  pub let mut _edit_buf  : [u8; 65536] = uninit @align(8)
+  pub let mut gap_start  : u64 = 0
+  pub let mut gap_end    : u64 = 65536
+  pub let mut total_len  : u64 = 0
+
+  pub let BUF_OK   : u64 = 0
+  pub let BUF_FULL : u64 = 1
+
+  // ==========================================================================
+  // buf_reset() -> ()
+  // Re-initialise to an empty buffer (one big gap). Leaf; no calls.
+  // ==========================================================================
+  pub let buf_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#3 buf_reset. Re-initialises the three gap-buffer state words to the empty-buffer configuration (gap_start=0, gap_end=65536, total_len=0). _edit_buf itself is left untouched — its bytes past whichever boundary is live are unreachable by construction, matching TtySink/FileRead's own .bss-reuse convention elsewhere in this tree. Leaf; no CALL, no push/pop, three independent lea+mov stores. No test mnemonic (no comparisons at all here).",
+      block: {
+        lea rcx, [rip + gap_start];
+        xor rax, rax;
+        mov [rcx], rax;
+
+        lea rcx, [rip + gap_end];
+        mov rax, 65536;
+        mov [rcx], rax;
+
+        lea rcx, [rip + total_len];
+        xor rax, rax;
+        mov [rcx], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buf_move_gap(pos) -> ()
+  //
+  // Internal primitive: slides the gap so gap_start == pos (pos is
+  // assumed already clamped to [0, total_len] by the caller). Classic
+  // gap-buffer move: shifts content bytes across the gap boundary one
+  // byte at a time in the direction that closes the distance to pos.
+  //
+  // Register plan (leaf; only caller-save touched, no push/pop):
+  //   r10 = target pos (from rdi)
+  //   r11 = working gap_start
+  //   r9  = working gap_end
+  //   r8  = &_edit_buf
+  // Writes r11/r9 back to gap_start/gap_end once at the end (not per
+  // iteration) — cheaper and just as correct since no CALL occurs
+  // mid-loop to observe the intermediate state.
+  // ==========================================================================
+  pub let buf_move_gap : (u64) -> () !{mem} @{} =
+    fn (pos: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#3 buf_move_gap. Slides the gap boundary to pos via the textbook gap-buffer shift: moving the gap left copies the byte immediately before the (shrinking) gap_start to the (shrinking) gap_end, decrementing both; moving it right copies the byte at gap_end to gap_start, incrementing both. Runs entirely in registers (r11=gap_start, r9=gap_end, r8=&_edit_buf, r10=target pos) and writes the two state words back to memory exactly once at buf_mg_store, since no CALL happens mid-loop that could observe a torn intermediate state. Byte load/store via xor rax,rax + mov_b (#1248), explicit *1 SIB scale (U1606). No test mnemonic — the three-way branch at buf_mg_entry is a plain cmp+je/jl, and both loop bodies use a do-while shape (unconditional first iteration once the branch has committed to a direction) so no redundant top-of-loop comparison duplicates the entry check. Leaf: no CALL, no push/pop; every register touched (rax, r8, r9, r10, r11, rcx) is caller-save so callers needing r12-r15/rbx preserved get that for free. Labels prefixed buf_mg_.",
+      block: {
+        mov r10, rdi;
+        lea rcx, [rip + gap_start];
+        mov r11, [rcx];
+        lea rcx, [rip + gap_end];
+        mov r9, [rcx];
+        lea r8, [rip + _edit_buf];
+
+        cmp r11, r10;
+        je buf_mg_store;
+        jl buf_mg_right;
+        jmp buf_mg_left;
+
+      buf_mg_left:
+        sub r11, 1;
+        sub r9, 1;
+        xor rax, rax;
+        mov_b rax, [r8 + r11*1];
+        mov_b [r8 + r9*1], rax;
+        cmp r11, r10;
+        jg buf_mg_left;
+        jmp buf_mg_store;
+
+      buf_mg_right:
+        xor rax, rax;
+        mov_b rax, [r8 + r9*1];
+        mov_b [r8 + r11*1], rax;
+        add r11, 1;
+        add r9, 1;
+        cmp r11, r10;
+        jl buf_mg_right;
+
+      buf_mg_store:
+        lea rcx, [rip + gap_start];
+        mov [rcx], r11;
+        lea rcx, [rip + gap_end];
+        mov [rcx], r9;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buf_normalize() -> ()
+  // Pushes the gap to the very end (gap_start = total_len, gap_end =
+  // 65536), so _edit_buf[0 .. total_len) becomes contiguous logical
+  // content. One nested call (buf_move_gap); the sub/add rsp,8
+  // bracket is the alignment pad since this function itself performs
+  // no push (mirrors format_record_write_u64_dec's stack-pad shape).
+  // ==========================================================================
+  pub let buf_normalize : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#3 buf_normalize. Calls buf_move_gap(total_len) so every byte of logical content lands contiguously at _edit_buf[0..total_len), letting Render / Editor / buf_read scan raw bytes without gap-aware translation. sub rsp,8 / add rsp,8 is the alignment pad: this function makes no push of its own, so without the pad the nested `call buf_move_gap` would land at rsp%16==8 (illegal for SysV CALL) given the assumed entry state rsp%16==8 (post-CALL convention this whole tree uses). Idempotent: once gap_start==total_len, buf_move_gap's entry check (cmp r11,r10; je buf_mg_store) returns immediately, so repeated normalize calls from multiple call sites (buf_read, edit_cursor_move, render_frame) cost nothing extra after the first.",
+      block: {
+        sub rsp, 8;
+        lea rcx, [rip + total_len];
+        mov rdi, [rcx];
+        call buf_move_gap;
+        add rsp, 8;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buf_insert(pos, byte) -> u64
+  //   RDI: pos   — clamped to [0, total_len]
+  //   RSI: byte  — low 8 bits used
+  //   RAX: BUF_OK (0) or BUF_FULL (1, gap exhausted at the 64 KiB cap)
+  // ==========================================================================
+  pub let buf_insert : (u64, u64) -> u64 !{mem} @{} =
+    fn (pos: u64) (byte: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#3 buf_insert. Clamps pos to total_len, refuses with BUF_FULL when gap_start==gap_end (the 64 KiB cap is reached), otherwise calls buf_move_gap(pos) so gap_start==pos, stores the byte at that slot, advances gap_start, and bumps total_len. 1-push prologue (rbx=byte, saved across the nested buf_move_gap call which otherwise only clobbers caller-save regs) lands rsp%16==0 at that call site from the assumed entry rsp%16==8. No test mnemonic (cmp reg,0 / cmp reg,reg throughout). Labels prefixed buf_in_.",
+      block: {
+        push rbx;
+        mov rbx, rsi;
+
+        lea rcx, [rip + total_len];
+        mov rax, [rcx];
+        cmp rdi, rax;
+        jle buf_in_pos_ok;
+        mov rdi, rax;
+      buf_in_pos_ok:
+
+        lea rcx, [rip + gap_start];
+        mov r10, [rcx];
+        lea rcx, [rip + gap_end];
+        mov r11, [rcx];
+        cmp r10, r11;
+        jl buf_in_not_full;
+        mov rax, 1;
+        pop rbx;
+        ret;
+
+      buf_in_not_full:
+        call buf_move_gap;
+
+        lea rcx, [rip + gap_start];
+        mov r10, [rcx];
+        lea r8, [rip + _edit_buf];
+        mov rax, rbx;
+        mov_b [r8 + r10*1], rax;
+        add r10, 1;
+        mov [rcx], r10;
+
+        lea rcx, [rip + total_len];
+        mov rax, [rcx];
+        add rax, 1;
+        mov [rcx], rax;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buf_delete(pos, count) -> u64
+  //   RDI: pos   — clamped to [0, total_len]
+  //   RSI: count — clamped to total_len - pos
+  //   RAX: BUF_OK (0) always (a clamped zero-length delete is a no-op OK)
+  // ==========================================================================
+  pub let buf_delete : (u64, u64) -> u64 !{mem} @{} =
+    fn (pos: u64) (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#3 buf_delete. Clamps pos to total_len and count to the bytes actually available (total_len - pos), then — unless the clamped count is 0 — calls buf_move_gap(pos) so gap_start==pos, extends gap_end by count (the count bytes immediately after the gap are logically deleted by folding them into the gap), and shrinks total_len by count. 1-push prologue (rbx=clamped count, callee-save across the nested buf_move_gap call) lands rsp%16==0 at that call site. No test mnemonic; no sub-reg-reg (available = total_len - pos computed via mov+sub with pos already clamped <= total_len, so no borrow). Labels prefixed buf_de_.",
+      block: {
+        push rbx;
+        mov rbx, rsi;
+
+        lea rcx, [rip + total_len];
+        mov rax, [rcx];
+        cmp rdi, rax;
+        jle buf_de_pos_ok;
+        mov rdi, rax;
+      buf_de_pos_ok:
+
+        mov r9, rax;
+        sub r9, rdi;
+        cmp rbx, r9;
+        jle buf_de_count_ok;
+        mov rbx, r9;
+      buf_de_count_ok:
+
+        cmp rbx, 0;
+        je buf_de_zero;
+
+        call buf_move_gap;
+
+        lea rcx, [rip + gap_end];
+        mov r10, [rcx];
+        add r10, rbx;
+        mov [rcx], r10;
+
+        lea rcx, [rip + total_len];
+        mov rax, [rcx];
+        sub rax, rbx;
+        mov [rcx], rax;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      buf_de_zero:
+        xor rax, rax;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // buf_read(pos, out, count) -> u64
+  //   RDI: pos    — logical start position
+  //   RSI: out    — destination buffer (caller-owned)
+  //   RDX: count  — requested byte count, clamped to what's available
+  //   RAX: bytes actually copied
+  //
+  // Normalizes first (buf_normalize), so the copy loop reads straight
+  // out of _edit_buf[pos .. pos+n) with no gap-aware translation.
+  // ==========================================================================
+  pub let buf_read : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pos: u64) (out: u64) (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#3 buf_read. Calls buf_normalize (pushes the gap to the end) so logical content is contiguous, clamps pos/count against the (possibly just-changed) total_len, then byte-copies the clamped range into the caller's out buffer. 3-push prologue (rbx=pos, r12=out, r13=count — all callee-save, surviving the nested buf_normalize call which itself only touches caller-save regs plus its own stack-neutral sub/add rsp,8 bracket) lands rsp%16==0 at that call site from the assumed entry rsp%16==8. Byte copy via xor rax,rax + mov_b load / mov_b store (#1248), explicit *1 SIB scale. No test mnemonic. Labels prefixed buf_rd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov rbx, rdi;
+        mov r12, rsi;
+        mov r13, rdx;
+
+        call buf_normalize;
+
+        lea rcx, [rip + total_len];
+        mov rax, [rcx];
+
+        cmp rbx, rax;
+        jl buf_rd_pos_ok;
+        xor r13, r13;
+        jmp buf_rd_copy;
+
+      buf_rd_pos_ok:
+        mov r9, rax;
+        sub r9, rbx;
+        cmp r13, r9;
+        jle buf_rd_copy;
+        mov r13, r9;
+
+      buf_rd_copy:
+        lea r8, [rip + _edit_buf];
+        xor rcx, rcx;
+      buf_rd_loop:
+        cmp rcx, r13;
+        jge buf_rd_done;
+        mov r10, rbx;
+        add r10, rcx;
+        xor rax, rax;
+        mov_b rax, [r8 + r10*1];
+        mov_b [r12 + rcx*1], rax;
+        add rcx, 1;
+        jmp buf_rd_loop;
+
+      buf_rd_done:
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

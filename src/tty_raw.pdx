@@ -1,0 +1,244 @@
+// src/tty_raw.pdx — edit R71.M1-002 (edit#2)
+// TtyRaw module: raw ANSI/CSI terminal primitives. Everything here is
+// plain sys_write of byte sequences to fd 1 — no KIND_TTY cap, no
+// ICANON/ECHO toggle at the kernel side. That substrate gap is
+// documented and still open even for shell's own line editor (see
+// shell/src/line_reader.pdx's lr_tty_set_raw / lr_tty_set_cooked,
+// both scaffolded no-ops pending a sys_cap_invoke wrapper + a
+// KIND_TTY cap seat neither of which land here at edit R71.M1). This
+// module's "raw mode" is therefore scoped exactly as edit#2 asks:
+// alternate-screen enter/exit + ANSI cursor addressing, all via
+// ordinary fd-1 byte writes any process may issue.
+//
+// Public surface (per edit#2)
+// ----------------------------
+//   edit_tty_raw_enter() -> ()   sys_write(1, "\x1b[?1049h", 8)
+//   edit_tty_raw_exit()  -> ()   sys_write(1, "\x1b[?1049l", 8)
+//   tty_raw_cursor_to(row,col) -> ()  sys_write(1, "\x1b[<row>;<col>H", n)
+//   tty_raw_erase_line() -> ()   sys_write(1, "\x1b[2K", 4)
+//
+// paideia-as compliance
+// ----------------------
+//   - Module name PascalCase basename (`TtyRaw`), matches file stem.
+//   - SC+ ID 1 = sys_write(fd, buf, count) per src/user/syscall_shim.pdx
+//     (same table cat/src/entry.pdx documents: 0=read,1=write,2=open,
+//     3=close,60=exit).
+//   - No test rN,rN; no `and rN, imm64` on r8-r15 (none used); no
+//     2-op imul; no neg; no sil/dil/bl aliases — the div-by-10
+//     decimal-into-buffer helper (ttyr_emit_dec) stores its ASCII
+//     digit via `mov [r10], dl`, the classic al/cl/dl/bl-family byte
+//     register that this tree's own mount_record.pdx /
+//     unmount_record.pdx precedent uses (dl, unlike bl, is not on
+//     the encoder's reserved-alias list).
+//   - Every `cmp reg, imm` immediate <= 4096, well under 0x7FFFFFFF.
+//   - Reserved-label discipline: every label prefixed `ttyr_`.
+//   - String literals on a single line each (fingerprint-extractor
+//     contract).
+
+module TtyRaw = structure {
+
+  // ==========================================================================
+  // Fixed ANSI/CSI byte sequences (.rodata).
+  // ==========================================================================
+  pub let tty_alt_enter     : [u8; 9] = "\x1b[?1049h\0"
+  pub let tty_alt_enter_len : u64 = 8
+
+  pub let tty_alt_exit      : [u8; 9] = "\x1b[?1049l\0"
+  pub let tty_alt_exit_len  : u64 = 8
+
+  pub let tty_erase_line     : [u8; 5] = "\x1b[2K\0"
+  pub let tty_erase_line_len : u64 = 4
+
+  // Scratch buffer for the composed cursor-addressing CSI sequence:
+  // worst case "\x1b[999;999H" = 10 bytes; 32 bytes leaves ample slop.
+  pub let mut _ttyr_csi_buf : [u8; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // edit_tty_raw_enter() -> ()
+  // Enter the alternate screen buffer. Leaf; one sys_write.
+  // ==========================================================================
+  pub let edit_tty_raw_enter : () -> () !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#2 edit_tty_raw_enter. sys_write(1, tty_alt_enter, 8) — writes ESC[?1049h to fd 1, switching the terminal to its alternate screen buffer (xterm/vt220 DECSET 1049 convention; matches the plan cited in R71.M1-002). Leaf: only rdi/rsi/rdx/rax touched (all caller-save) plus the SYSCALL clobber (rcx, r11) — no push/pop parity to preserve. @{fs} matches this tree's convention of gating fd-1 writes the same as file writes in the syscall shim (see cat/src/entry.pdx's own sys_write call sites, all @{fs}).",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + tty_alt_enter];
+        mov rdx, 8;
+        mov rax, 1;
+        syscall;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // edit_tty_raw_exit() -> ()
+  // Restore the primary screen buffer. Leaf; one sys_write. Every
+  // exit path in editor.pdx (Ctrl+Q quit, and any future error exit)
+  // must call this before sys_exit so the invoking shell's terminal
+  // is never left stuck on the alternate screen (edit#2's
+  // restore-on-exit requirement).
+  // ==========================================================================
+  pub let edit_tty_raw_exit : () -> () !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#2 edit_tty_raw_exit. sys_write(1, tty_alt_exit, 8) — writes ESC[?1049l to fd 1, restoring the terminal's primary screen buffer. Symmetric peer of edit_tty_raw_enter; same leaf shape, same @{fs} posture. Called from Editor::edit_quit (and any future error-exit path) before sys_exit, per edit#2's restore-on-exit requirement.",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + tty_alt_exit];
+        mov rdx, 8;
+        mov rax, 1;
+        syscall;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // tty_raw_erase_line() -> ()
+  // Erase the entire current terminal line (CSI 2K). Used by
+  // Render::render_frame before writing a dirty line's new content,
+  // so a shorter replacement line doesn't leave stale trailing bytes
+  // from the previous, longer content.
+  // ==========================================================================
+  pub let tty_raw_erase_line : () -> () !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#2/edit#4 tty_raw_erase_line. sys_write(1, tty_erase_line, 4) — ESC[2K, erase-entire-line. Called once per dirty row by Render::render_frame immediately after positioning the cursor and before writing that row's content bytes. Leaf; same shape as edit_tty_raw_enter.",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + tty_erase_line];
+        mov rdx, 4;
+        mov rax, 1;
+        syscall;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // ttyr_emit_dec(value, dest) -> u64
+  //   RDI: value — u64 to render as decimal ASCII (no sign; rows/cols
+  //                are always small non-negative terminal coordinates)
+  //   RSI: dest  — destination byte buffer (caller-owned, no NUL)
+  //   RAX: number of ASCII digit bytes written
+  //
+  // Internal helper for tty_raw_cursor_to. Same div-by-10-into-a-
+  // caller-buffer shape as shell/src/history.pdx's history_encode
+  // helper and mount.pdxfs's mount_record_print_decimal, adapted to
+  // write into an arbitrary destination offset instead of a fixed
+  // fd. Leaf: only caller-save registers touched, plus a self-
+  // contained sub/add rsp,24 scratch bracket for the reversed-digit
+  // staging area (no CALL inside, so no alignment concern of its own
+  // — the bracket exists purely for the 20-byte digit scratch, not
+  // for call-site alignment).
+  // ==========================================================================
+  pub let ttyr_emit_dec : (u64, u64) -> u64 !{mem} @{} =
+    fn (value: u64) (dest: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "edit#2 ttyr_emit_dec. Zero special case: writes a single '0' byte at [dest], returns 1. General case: sub rsp,24 stages a 20-byte reversed-digit scratch (4 bytes alignment slop, matching format_record_write_u64_dec's own sizing); r9 = remaining value, r10 = cursor at rsp+19 walking DOWN one byte per digit (`mov rax,r9; mov rcx,10; xor rdx,rdx; div rcx; add rdx,0x30; mov [r10],dl; mov r9,rax`, identical algorithm + register plan to mount.pdxfs's mount_record_print_decimal and unmount.pdxfs's unmount_record_write_u64_dec) until r9 hits 0. `mov [r10],dl` stores the ASCII digit via the classic al/cl/dl/bl-family low-byte register — dl specifically, not on the encoder's sil/dil/bl reserved-alias list. Digit count = (rsp+20) - r10; a second byte-copy loop (xor rdx,rdx; mov_b rdx,[r10+rcx*1]; mov_b [rsi+rcx*1],rdx — #1248 idiom) copies MSB-first into the caller's dest buffer at rsi (already correctly ordered since r10 walked down). add rsp,24 restores the stack before ret. No test mnemonic (every zero-check cmp reg,0); no `and`/`neg`; only `div` by the compile-time constant 10 (a division, not a multiply, so it is unaffected by this tree's imul-avoidance convention). Labels prefixed ttyr_ed_.",
+      block: {
+        cmp rdi, 0;
+        jne ttyr_ed_nonzero;
+        mov_b [rsi], 0x30;
+        mov rax, 1;
+        ret;
+
+      ttyr_ed_nonzero:
+        sub rsp, 24;
+        mov r9, rdi;
+        lea r10, [rsp + 19];
+        mov rcx, 10;
+
+      ttyr_ed_loop:
+        mov rax, r9;
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        mov [r10], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je ttyr_ed_emit;
+        sub r10, 1;
+        jmp ttyr_ed_loop;
+
+      ttyr_ed_emit:
+        lea r8, [rsp + 20];
+        mov rax, r8;
+        sub rax, r10;
+        mov rcx, 0;
+
+      ttyr_ed_copy:
+        cmp rcx, rax;
+        jge ttyr_ed_done;
+        xor rdx, rdx;
+        mov_b rdx, [r10 + rcx*1];
+        mov_b [rsi + rcx*1], rdx;
+        add rcx, 1;
+        jmp ttyr_ed_copy;
+
+      ttyr_ed_done:
+        add rsp, 24;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // tty_raw_cursor_to(row, col) -> ()
+  //   RDI: row (1-indexed terminal row)
+  //   RSI: col (1-indexed terminal column)
+  //
+  // Composes "\x1b[<row>;<col>H" into _ttyr_csi_buf and writes it to
+  // fd 1 in a single sys_write.
+  // ==========================================================================
+  pub let tty_raw_cursor_to : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (row: u64) (col: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#2 tty_raw_cursor_to. Composes ESC[<row>;<col>H (ANSI CSI cursor position) into _ttyr_csi_buf: bytes 0-1 are the fixed ESC '[' prefix (immediate-to-memory mov_b stores); ttyr_emit_dec writes the row digits starting at offset 2 and returns their length (r14); a literal ';' follows at offset 2+len(row); ttyr_emit_dec writes the col digits after that and returns their length; a literal 'H' terminates the sequence; one sys_write(1, buf, total_len) emits it. 5-push prologue (rbx=row, r12=col, r13=buf base, r14=row-digit length / running cursor, r15 unused but pushed for the odd-count-of-5 alignment discipline this file's nested-call sites need) lands rsp%16==0 at both ttyr_emit_dec call sites from the assumed entry rsp%16==8. None of rbx/r12-r15 are touched by ttyr_emit_dec (a caller-save-only leaf), so they survive both calls untouched — no reload needed between them. Labels prefixed ttyr_ct_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+        lea r13, [rip + _ttyr_csi_buf];
+
+        mov_b [r13 + 0*1], 0x1B;
+        mov_b [r13 + 1*1], 0x5B;
+
+        mov rdi, rbx;
+        lea rsi, [r13 + 2*1];
+        call ttyr_emit_dec;
+        mov r14, rax;
+
+        mov r15, r14;
+        add r15, 2;
+        mov_b [r13 + r15*1], 0x3B;
+        add r15, 1;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        add rsi, r15;
+        call ttyr_emit_dec;
+
+        add r15, rax;
+        mov_b [r13 + r15*1], 0x48;
+        add r15, 1;
+
+        mov rdi, 1;
+        mov rsi, r13;
+        mov rdx, r15;
+        mov rax, 1;
+        syscall;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
