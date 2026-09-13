@@ -77,7 +77,7 @@ module Render = structure {
       justification: "edit#4 render_reset. Fills all 64 words of _dirty_lines with 0xFFFFFFFFFFFFFFFF (mov rax,-1 sign-extends to all-ones in 64-bit context — no movabs needed) via a 64-iteration store loop, `mov [r8+rcx*8], rax`. Leaf: rax/rcx/r8 only (all caller-save), no push/pop. No test mnemonic (cmp rcx,64 loop bound).",
       block: {
         lea r8, [rip + _dirty_lines];
-        mov rax, -1;
+        mov rax, 0xFFFFFFFFFFFFFFFF;
         xor rcx, rcx;
       rr_loop:
         cmp rcx, 64;

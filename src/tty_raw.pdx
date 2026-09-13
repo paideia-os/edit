@@ -204,11 +204,11 @@ module TtyRaw = structure {
         mov r12, rsi;
         lea r13, [rip + _ttyr_csi_buf];
 
-        mov_b [r13 + 0*1], 0x1B;
-        mov_b [r13 + 1*1], 0x5B;
+        mov_b [r13 + 0], 0x1B;
+        mov_b [r13 + 1], 0x5B;
 
         mov rdi, rbx;
-        lea rsi, [r13 + 2*1];
+        lea rsi, [r13 + 2];
         call ttyr_emit_dec;
         mov r14, rax;
 
