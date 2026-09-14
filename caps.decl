@@ -40,14 +40,23 @@
 #     Keystroke input (Editor::_start's edit_main_loop) reads fd 0
 #     via the ordinary sys_read SC+ ID, not a capability-gated path.
 #
-#   KIND_PDXFS_FILE (read, <arg-path>)
-#   KIND_PDXFS_FILE (write, <arg-path>)
-#     File open+read (initial load from argv[1], Ctrl+O reload) and
-#     open+write (Ctrl+S save), both scoped to the single path passed
-#     on argv or set via Ctrl+O/Ctrl+S at runtime (M1 has no `:e`/`:w`
-#     ex-command to retarget a different path -- that lands at edit#6
-#     and would widen this to an argv-narrowed <arg-path> pattern
-#     matching cat/cp's own per-argument narrowing convention).
+#   KIND_PDXFS_FILE (read)
+#   KIND_PDXFS_FILE (write)
+#     File open+read (initial load from argv[1], Ctrl+O / `:e <path>`
+#     reload) and open+write (Ctrl+S / `:w` save). UNNARROWED as of
+#     edit#6 (R71.M1-006): `:e <path>` lets the user retarget the
+#     editor's working file to ANY path typed at the command line at
+#     runtime, not just argv[1] -- an editor's whole point is opening
+#     arbitrary files a session decides on interactively, so (unlike
+#     cat/cp's single-argv-path narrowing, which fits a one-shot batch
+#     tool) an `<arg-path>` narrowing would have to be re-validated on
+#     every `:e`, which no cap-narrowing primitive in this codebase
+#     supports mid-process today. This is the same posture a real
+#     shell/editor pair takes: the interactive tool holds a broad file
+#     capability and the shell's own exec-time reconciliation (this
+#     manifest) is the actual gate on which BINARIES may hold it, not
+#     which paths a already-running one may touch. Revisit if/when a
+#     mid-process cap-renarrowing primitive lands.
 #
 #   KIND_IPC_ENDPOINT
 #     Reserved for a future semantic-pipe emission (an EditRecord@0.1
@@ -65,8 +74,8 @@
 requires:
   - KIND_USER
   - KIND_TTY (write)
-  - KIND_PDXFS_FILE (read, <arg-path>)
-  - KIND_PDXFS_FILE (write, <arg-path>)
+  - KIND_PDXFS_FILE (read)
+  - KIND_PDXFS_FILE (write)
   - KIND_IPC_ENDPOINT
 
 # No declared output schemas at R71.M1 -- the semantic-pipe emission

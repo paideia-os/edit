@@ -1,33 +1,53 @@
-// src/editor.pdx — edit R71.M1-005 (edit#5)
+// src/editor.pdx — edit R71.M1-005 (edit#5), extended by edit#6/edit#7
 // Editor module: process entry point (_start) + the main REPL that
 // ties TtyRaw + Buffer + Render together, plus cursor-motion helpers.
 //
-// Scope (per edit#5's dispatch table)
-// ------------------------------------
-//   printable (0x20..0x7E)  -> buf_insert, cursor_pos += 1
-//   DEL (0x7F) / BS (0x08)  -> buf_delete of the byte before cursor
-//   CR (0x0D) / LF (0x0A)   -> buf_insert('\n'), cursor_pos += 1
+// Scope (per edit#5's dispatch table, extended by edit#6/edit#7)
+// ------------------------------------------------------------------
+//   printable (0x20..0x7E)  -> buf_insert, cursor_pos += 1, edit_dirty=1
+//   DEL (0x7F) / BS (0x08)  -> buf_delete of the byte before cursor,
+//                              edit_dirty=1
+//   CR (0x0D) / LF (0x0A)   -> buf_insert('\n'), cursor_pos += 1,
+//                              edit_dirty=1
 //   arrows (ESC [ A/B/C/D)  -> edit_cursor_move
-//   Ctrl+S (0x13)           -> save: sys_open+sys_write+sys_close
-//   Ctrl+O (0x0F)           -> load: buf_reset + reload from filename
-//   ESC alone (no `[`)      -> command mode, DEFERRED to edit#6 (no-op)
-//   Ctrl+Q (0x11)           -> quit (M1 addition — edit#6's colon
-//                              commands, including `:q`, are not in
-//                              this cohort, and ESC is deliberately a
-//                              no-op per the deferral above, so
-//                              without a Ctrl+Q binding the process
-//                              would have no way to exit and restore
-//                              the primary screen; edit_tty_raw_exit
-//                              is called before sys_exit to honour
-//                              edit#2's restore-on-exit contract)
+//   Ctrl+S (0x13)           -> edit_do_save (edit#7: fingerprints
+//                              "edit ok -- file=<path> bytes=<N>" on
+//                              success, clears edit_dirty)
+//   Ctrl+O (0x0F)           -> edit_do_load_current (buf_reset + reload
+//                              from filename, clears edit_dirty)
+//   ESC then `:`            -> edit#6 modal command line: reads bytes
+//                              into _edit_cmd_buf until Enter (the `:`
+//                              itself is the mode trigger, not stored —
+//                              _edit_cmd_buf holds exactly what a real
+//                              vi command line shows after its own `:`
+//                              prompt); dispatches on the collected
+//                              text's prefix: "w" -> edit_do_save,
+//                              "q" -> quit, "wq" -> edit_do_save then
+//                              quit, "e <path>" -> edit_set_filename +
+//                              edit_do_load_current. ESC while
+//                              collecting cancels (discards the partial
+//                              command, no-op). An unrecognised command
+//                              is silently ignored.
+//   ESC then anything else  -> no-op (unrecognised CSI-adjacent byte)
+//   Ctrl+Q (0x11)           -> quit: edit#7 fingerprints
+//                              "edit exit -- unsaved-changes=<0|1>" (0
+//                              or 1 mirroring edit_dirty) to fd 2, then
+//                              edit_tty_raw_exit (edit#2's
+//                              restore-on-exit contract), then
+//                              sys_exit(0). `:q` and `:wq` jump into
+//                              this SAME quit path (one exit sequence,
+//                              one fingerprint site).
 //
-// Filename handling (M1 scope decision — no ex-command line yet)
+// Filename handling (M1 scope, extended by edit#6)
 // ----------------------------------------------------------------
 // `edit <path>` at argv[1] loads that file at startup (best-effort:
 // a missing file just starts with an empty buffer) and is the target
-// for both Ctrl+S (save) and Ctrl+O (reload-discarding-changes).
-// `edit` with no argument has no filename; Ctrl+S / Ctrl+O are then
-// no-ops. A `:w <path>` / `:e <path>` command line is edit#6 scope.
+// for both Ctrl+S/`:w` (save) and Ctrl+O/`:e`-without-a-path... no —
+// `:e <path>` ALWAYS names a new path (edit_set_filename runs first);
+// there is no bare `:e` with no argument (an empty-or-malformed `:e`
+// command line is ignored, matching every other unrecognised colon
+// command). `edit` with no argument has no filename; Ctrl+S/`:w` are
+// then no-ops (edit_do_save's own edit_filename_len==0 guard).
 //
 // Cursor motion simplification (M1 scope decision)
 // ---------------------------------------------------
@@ -83,6 +103,30 @@ module Editor = structure {
 
   pub let mut _edit_key_buf : [u8; 8]    = uninit @align(8)
   pub let mut _edit_io_buf  : [u8; 4096] = uninit @align(8)
+
+  // -- edit#6 (M1-006): modal command line (`:w`, `:q`, `:wq`, `:e <path>`) -
+  // Entered on a bare ESC (no `[` follows, matching edit#5's own
+  // forward-declared deferral) followed by `:`; the `:` byte itself is
+  // the mode trigger and is NOT stored in the buffer — _edit_cmd_buf
+  // holds exactly what a real vi command line shows after its own `:`
+  // prompt (e.g. "w", "q", "wq", "e path/to/file").
+  pub let mut _edit_cmd_buf : [u8; 256] = uninit @align(8)
+  pub let mut edit_cmd_len  : u64       = 0
+
+  // -- edit#7 (M1-007): unsaved-changes tracking + fingerprints --------
+  // 1 = the buffer has been modified (insert/enter/backspace) since the
+  // last successful save or load; cleared by edit_do_save /
+  // edit_do_load_current, set by every successful mutation in _start's
+  // dispatch. Zero-initialized like every other `mut ... = 0` global in
+  // this tree, matching the true "no edits yet" state at process start.
+  pub let mut edit_dirty : u64 = 0
+
+  pub let mut _edit_fp_buf : [u8; 320] = uninit @align(8)
+
+  pub let edit_ok_prefix : [u8; 16] = "edit ok -- file="
+  pub let edit_ok_mid    : [u8; 7]  = " bytes="
+  pub let edit_exit_msg_0 : [u8; 31] = "edit exit -- unsaved-changes=0\n"
+  pub let edit_exit_msg_1 : [u8; 31] = "edit exit -- unsaved-changes=1\n"
 
   // ==========================================================================
   // edit_line_start(pos) -> u64
@@ -379,6 +423,189 @@ module Editor = structure {
     }
 
   // ==========================================================================
+  // edit_do_save() -> u64
+  //   RAX: 0 = saved + fingerprinted, 1 = no filename (no-op),
+  //        2 = sys_open failed
+  //
+  // Factors the Ctrl+S / `:w` / `:wq` save path into one callable (edit#7).
+  // On success, emits "edit ok -- file=<path> bytes=<N>\n" to fd 2 and
+  // clears edit_dirty.
+  // ==========================================================================
+  pub let edit_do_save : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#7 edit_do_save. Refuses (rax=1) if edit_filename_len==0. Else sys_open(_edit_filename, O_WRONLY|O_CREAT|O_TRUNC=0xC1, mode=0644=0x1A4) SC+2; rax<0 -> rax=2 (open failed). On success: mov rbx,rax (fd); call buf_normalize; mov r12,[total_len]; sys_write(rbx,&_edit_buf,r12) SC+1; sys_close(rbx) SC+3. Then composes 'edit ok -- file=<path> bytes=<N>\\n' into _edit_fp_buf by running offset r13: copy edit_ok_prefix (16B, r13=0..16), copy _edit_filename[0..edit_filename_len) at r13=16 (r13 becomes 16 after, via add r13,pathlen), copy edit_ok_mid (7B) at the new r13 (r13 += 7), call ttyr_emit_dec(r12, &_edit_fp_buf+r13) for the byte count (r13 += returned digit count), store a literal '\\n' at r13 (r13 += 1), sys_write(2, &_edit_fp_buf, r13) SC+1. Zeroes edit_dirty. Returns 0. 3-push prologue (rbx=fd, r12=byte count / ttyr_emit_dec arg, r13=running compose offset) is an ODD count from the assumed entry rsp%16==8: 3*8=24, 8+24=32, 32%16==0 — already aligned for the nested buf_normalize / ttyr_emit_dec call sites with no extra pad. Neither callee touches rbx/r12/r13 (both leaf, caller-save-only by their own docs), so no reload is needed between calls. Byte copies use xor rax,rax + mov_b (#1248) with explicit *1 SIB scale; destination addresses are always (fresh &_edit_fp_buf) + (fixed r13 base) + (loop index register), matching buf_rd_loop's own base+index-via-add-then-*1 idiom rather than chained lea. Labels prefixed eds_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        lea rcx, [rip + edit_filename_len];
+        mov rax, [rcx];
+        cmp rax, 0;
+        je eds_no_filename;
+
+        lea rdi, [rip + _edit_filename];
+        mov rsi, 0xC1;
+        mov rdx, 0x1A4;
+        mov rax, 2;
+        syscall;
+        cmp rax, 0;
+        jl eds_open_fail;
+        mov rbx, rax;
+
+        call buf_normalize;
+
+        lea rcx, [rip + total_len];
+        mov r12, [rcx];
+
+        mov rdi, rbx;
+        lea rsi, [rip + _edit_buf];
+        mov rdx, r12;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, rbx;
+        mov rax, 3;
+        syscall;
+
+        lea r8, [rip + _edit_fp_buf];
+        lea r9, [rip + edit_ok_prefix];
+        xor rcx, rcx;
+      eds_prefix_loop:
+        cmp rcx, 16;
+        jge eds_prefix_done;
+        xor rax, rax;
+        mov_b rax, [r9 + rcx*1];
+        mov_b [r8 + rcx*1], rax;
+        add rcx, 1;
+        jmp eds_prefix_loop;
+      eds_prefix_done:
+        mov r13, 16;
+
+        lea rcx, [rip + edit_filename_len];
+        mov r10, [rcx];
+        lea r9, [rip + _edit_filename];
+        xor rcx, rcx;
+      eds_path_loop:
+        cmp rcx, r10;
+        jge eds_path_done;
+        xor rax, rax;
+        mov_b rax, [r9 + rcx*1];
+        lea r8, [rip + _edit_fp_buf];
+        mov r11, r13;
+        add r11, rcx;
+        mov_b [r8 + r11*1], rax;
+        add rcx, 1;
+        jmp eds_path_loop;
+      eds_path_done:
+        add r13, r10;
+
+        lea r9, [rip + edit_ok_mid];
+        xor rcx, rcx;
+      eds_mid_loop:
+        cmp rcx, 7;
+        jge eds_mid_done;
+        xor rax, rax;
+        mov_b rax, [r9 + rcx*1];
+        lea r8, [rip + _edit_fp_buf];
+        mov r11, r13;
+        add r11, rcx;
+        mov_b [r8 + r11*1], rax;
+        add rcx, 1;
+        jmp eds_mid_loop;
+      eds_mid_done:
+        add r13, 7;
+
+        mov rdi, r12;
+        lea rsi, [rip + _edit_fp_buf];
+        add rsi, r13;
+        call ttyr_emit_dec;
+        add r13, rax;
+
+        lea r8, [rip + _edit_fp_buf];
+        mov rax, 0x0A;
+        mov_b [r8 + r13*1], rax;
+        add r13, 1;
+
+        mov rdi, 2;
+        lea rsi, [rip + _edit_fp_buf];
+        mov rdx, r13;
+        mov rax, 1;
+        syscall;
+
+        lea rcx, [rip + edit_dirty];
+        xor rax, rax;
+        mov [rcx], rax;
+
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      eds_no_filename:
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      eds_open_fail:
+        mov rax, 2;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // edit_do_load_current() -> u64
+  //   RAX: 0 = reloaded, 1 = no filename (no-op)
+  //
+  // Factors the Ctrl+O / `:e`-after-edit_set_filename reload path into
+  // one callable (edit#6). Discards unsaved changes with no
+  // confirmation prompt (deferred; matches edit#5's own documented M1
+  // posture toward Ctrl+O).
+  // ==========================================================================
+  pub let edit_do_load_current : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "edit#6 edit_do_load_current. Refuses (rax=1) if edit_filename_len==0. Else: call buf_reset; call edit_load_file (best-effort — a missing file just leaves the freshly-reset empty buffer, matching cat's own missing-file posture); zero cursor_pos; call render_reset (whole-buffer replace, every line dirty); zero edit_dirty (a fresh load has no unsaved changes relative to what is now in the buffer); rax=0. sub rsp,8 / add rsp,8 brackets the whole body since this function makes no push of its own and holds no register state across any of its three nested calls (buf_reset, edit_load_file, render_reset) that isn't immediately reloaded from memory afterward — the pad alone keeps every call site at rsp%16==0 from the assumed entry rsp%16==8. Labels prefixed edlc_.",
+      block: {
+        sub rsp, 8;
+
+        lea rcx, [rip + edit_filename_len];
+        mov rax, [rcx];
+        cmp rax, 0;
+        je edlc_no_filename;
+
+        call buf_reset;
+        call edit_load_file;
+
+        lea rcx, [rip + cursor_pos];
+        xor rax, rax;
+        mov [rcx], rax;
+
+        call render_reset;
+
+        lea rcx, [rip + edit_dirty];
+        xor rax, rax;
+        mov [rcx], rax;
+
+        add rsp, 8;
+        xor rax, rax;
+        ret;
+
+      edlc_no_filename:
+        add rsp, 8;
+        mov rax, 1;
+        ret;
+      }
+    }
+
+  // ==========================================================================
   // _start — process entry point. Never returns.
   //
   // Sequence: buf_reset + render_reset (always start clean) ->
@@ -392,7 +619,7 @@ module Editor = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "edit#5 _start. (0) sub rsp,8 aligns rsp for every nested call in this function (execve delivers rsp%16==8 per this tree's `_start` convention; -8 yields 0 for SysV CALL; never restored since this function ends in sys_exit and is @no_frame). (1) mov r13,rdi (argc); mov r14,rsi (argv) per the frozen execve ABI. (2) call buf_reset; call render_reset — always start from a clean empty buffer with a full-repaint dirty bitmap. (3) cmp r13,2; jl edit_skip_filename — argc<2 means no positional path, skip straight to entering raw mode. (4) Otherwise: mov rdi,[r14+8] (argv[1]); call edit_set_filename; call edit_load_file (best-effort; a missing file just leaves the freshly-reset empty buffer in place). (5) edit_skip_filename: call edit_tty_raw_enter (ESC[?1049h); call render_frame (initial full paint, every line dirty from render_reset); call edit_compute_row_col; position the hardware cursor via tty_raw_cursor_to(cursor_row+1, cursor_col+1) (1-indexed). (6) edit_main_loop: sys_read(0, _edit_key_buf, 1) (SC+ ID 0); rax != 1 (no byte, or error) retries the same read rather than treating it as EOF — matches the tty0 backing's non-blocking-poll shape documented elsewhere in this tree (shell/src/line_reader.pdx), except here the block-and-retry happens inline rather than via sys_yield since edit has no scheduler-yield primitive wired in at M1. (7) Dispatch the one byte read (xor rax,rax + mov_b, #1248) via a cmp-chain: 0x11 (Ctrl+Q) -> edit_quit; 0x1B (ESC) -> edit_handle_esc (arrow-key FSM / deferred command mode, see below); 0x7F or 0x08 (DEL/BS) -> edit_handle_bs; 0x0D or 0x0A (CR/LF) -> edit_handle_enter; 0x13 (Ctrl+S) -> edit_handle_save; 0x0F (Ctrl+O) -> edit_handle_load; outside [0x20, 0x7E] and not otherwise matched -> ignored, straight to edit_after_dispatch; else falls through to the printable-insert path. (8) Printable: buf_insert(cursor_pos, byte); on BUF_OK, cursor_pos += 1, edit_compute_row_col, render_mark_dirty(cursor_row) (single-line change, no structural shift). (9) Enter: buf_insert(cursor_pos, 10); on BUF_OK, cursor_pos += 1, edit_compute_row_col, then mark EVERY line from the new cursor_row through VIEW_ROWS-1 (=23) dirty via edit_enter_mark_loop, since inserting a newline shifts every subsequent visible line's content down by one logical line. (10) Backspace/DEL: if cursor_pos==0, no-op; else del_pos=cursor_pos-1 (held in rbx, callee-save across the nested calls), buf_read(del_pos, _edit_key_buf, 1) peeks the byte about to be deleted (r12, callee-save, holds it across the following calls), buf_delete(del_pos, 1), cursor_pos=del_pos, edit_compute_row_col; if the deleted byte was '\\n' (r12==10) the same structural mark-every-subsequent-line loop as Enter runs (deleting a newline also shifts every later line up by one), else only cursor_row is marked dirty. (11) Ctrl+S: if edit_filename_len==0, no-op; else sys_open(_edit_filename, O_WRONLY|O_CREAT|O_TRUNC=0xC1, mode=0644=0x1A4) (SC+ ID 2), on success (fd in rbx) call buf_normalize then sys_write(fd, _edit_buf, total_len) (SC+ ID 1, cross-module direct field access — same convention cat/src/entry.pdx uses for cat_schema_id) and sys_close(fd) (SC+ ID 3); no dirty-marking needed (content and cursor are unchanged by a save). (12) Ctrl+O: if edit_filename_len==0, no-op; else buf_reset, edit_load_file (discarding all unsaved changes — no confirmation prompt, deferred to edit#6's command line), cursor_pos=0, render_reset (whole-buffer replace, every line dirty). (13) edit_handle_esc: reads one more byte (SC+ ID 0); if it isn't 0x5B ('[') this was a bare ESC — command mode, DEFERRED to edit#6, no-op (the extra consumed byte is a documented M1 approximation, see module header) — else reads a third byte and maps 'A'/'B'/'C'/'D' (0x41/0x42/0x43/0x44) to edit_cursor_move's up/down/right/left dir codes (2/3/1/0); any other third byte is an unrecognised CSI sequence, ignored. (14) edit_quit: call edit_tty_raw_exit (ESC[?1049l, edit#2's restore-on-exit contract) then sys_exit(0) (SC+ ID 60), never returns; defensive hlt for impossible fallthrough. (15) edit_after_dispatch (the shared tail every handler above falls through or jumps to): call render_frame (redraws whatever got marked dirty), call edit_compute_row_col, reposition the hardware cursor via tty_raw_cursor_to(cursor_row+1, cursor_col+1), jmp edit_main_loop. Every `cmp reg, imm` immediate here is a byte value, a small dir code, a fixed row/col bound (24), or a fixed open-flags/mode constant — all well under 0x7FFFFFFF. No test mnemonic. No 2-op imul. No neg. No sil/dil/bl. All labels prefixed edit_.",
+      justification: "edit#5 _start, extended by edit#6/edit#7. (0) sub rsp,8 aligns rsp for every nested call in this function (execve delivers rsp%16==8 per this tree's `_start` convention; -8 yields 0 for SysV CALL; never restored since this function ends in sys_exit and is @no_frame). (1) mov r13,rdi (argc); mov r14,rsi (argv) per the frozen execve ABI. (2) call buf_reset; call render_reset — always start from a clean empty buffer with a full-repaint dirty bitmap. (3) cmp r13,2; jl edit_skip_filename — argc<2 means no positional path, skip straight to entering raw mode. (4) Otherwise: mov rdi,[r14+8] (argv[1]); call edit_set_filename; call edit_load_file (best-effort; a missing file just leaves the freshly-reset empty buffer in place). (5) edit_skip_filename: call edit_tty_raw_enter (ESC[?1049h); call render_frame (initial full paint, every line dirty from render_reset); call edit_compute_row_col; position the hardware cursor via tty_raw_cursor_to(cursor_row+1, cursor_col+1) (1-indexed). (6) edit_main_loop: sys_read(0, _edit_key_buf, 1) (SC+ ID 0); rax != 1 (no byte, or error) retries the same read rather than treating it as EOF — matches the tty0 backing's non-blocking-poll shape documented elsewhere in this tree (shell/src/line_reader.pdx), except here the block-and-retry happens inline rather than via sys_yield since edit has no scheduler-yield primitive wired in at M1. (7) Dispatch the one byte read (xor rax,rax + mov_b, #1248) via a cmp-chain: 0x11 (Ctrl+Q) -> edit_quit; 0x1B (ESC) -> edit_handle_esc; 0x7F or 0x08 (DEL/BS) -> edit_handle_bs; 0x0D or 0x0A (CR/LF) -> edit_handle_enter; 0x13 (Ctrl+S) -> edit_handle_save; 0x0F (Ctrl+O) -> edit_handle_load; outside [0x20, 0x7E] and not otherwise matched -> ignored, straight to edit_after_dispatch; else falls through to the printable-insert path. (8) Printable: buf_insert(cursor_pos, byte); on BUF_OK, cursor_pos += 1, edit_dirty=1 (edit#7), edit_compute_row_col, render_mark_dirty(cursor_row) (single-line change, no structural shift). (9) Enter: buf_insert(cursor_pos, 10); on BUF_OK, cursor_pos += 1, edit_dirty=1, edit_compute_row_col, then mark EVERY line from the new cursor_row through VIEW_ROWS-1 (=23) dirty via edit_enter_mark_loop, since inserting a newline shifts every subsequent visible line's content down by one logical line. (10) Backspace/DEL: if cursor_pos==0, no-op; else del_pos=cursor_pos-1 (held in rbx, callee-save across the nested calls), buf_read(del_pos, _edit_key_buf, 1) peeks the byte about to be deleted (r12, callee-save, holds it across the following calls), buf_delete(del_pos, 1), cursor_pos=del_pos, edit_dirty=1, edit_compute_row_col; if the deleted byte was '\\n' (r12==10) the same structural mark-every-subsequent-line loop as Enter runs (deleting a newline also shifts every later line up by one), else only cursor_row is marked dirty. (11) Ctrl+S / `:w` (edit#7): `call edit_do_save; jmp edit_after_dispatch` — the Ctrl+S keybinding and the `:w` colon command now share ONE callable (see edit_do_save's own doc for the sys_open/write/close + fingerprint sequence). (12) Ctrl+O / bare `:e`-with-no-path is unreachable (edit#6): `call edit_do_load_current; jmp edit_after_dispatch` — see that function's own doc. (13) edit_handle_esc: reads one more byte (SC+ ID 0); 0x5B ('[') -> edit_esc_arrow (unchanged arrow-key FSM: reads a third byte and maps 'A'/'B'/'C'/'D' 0x41/0x42/0x43/0x44 to edit_cursor_move's up/down/right/left dir codes 2/3/1/0; any other third byte is an unrecognised CSI sequence, ignored); 0x3A (':') -> edit_cmdline_enter (edit#6 modal command line, see below); anything else -> edit_after_dispatch (unrecognised bare-ESC follower, no-op). (14, edit#6) edit_cmdline_enter/_loop/_bs/_dispatch/_single/_do_w/_wq: zeroes edit_cmd_len, then blocking-reads one byte at a time (same retry-on-no-byte shape as edit_main_loop) into _edit_cmd_buf (cap 255, overflow silently dropped, matching edit_set_filename's own bounded-copy posture) until CR/LF (-> edit_cmdline_dispatch) or ESC (-> edit_after_dispatch, cancel/discard) or DEL/BS (-> edit_cmdline_bs, decrements edit_cmd_len if > 0). edit_cmdline_dispatch inspects _edit_cmd_buf[0..edit_cmd_len): len==1 and buf[0]=='w'(0x77) -> edit_do_save; len==1 and buf[0]=='q'(0x71) -> edit_quit directly; len==2 and buf==\"wq\" -> edit_do_save then edit_quit; len>=3 and buf[0]=='e'(0x65) and buf[1]==' '(0x20) -> NUL-terminate _edit_cmd_buf at edit_cmd_len, call edit_set_filename(&_edit_cmd_buf+2), call edit_do_load_current; anything else (including len==0, an immediate Enter after ':') -> edit_after_dispatch, no-op. (15, edit#7) edit_quit: loads edit_dirty; writes edit_exit_msg_1 (\"edit exit -- unsaved-changes=1\\n\", 31 bytes) to fd 2 if nonzero, else edit_exit_msg_0 (...=0\\n, 31 bytes); both paths fall into edit_quit_restore: call edit_tty_raw_exit (ESC[?1049l, edit#2's restore-on-exit contract) then sys_exit(0) (SC+ ID 60), never returns; defensive hlt for impossible fallthrough. `:q`/`:wq` jump into this SAME edit_quit label — one exit sequence, one fingerprint site. (16) edit_after_dispatch (the shared tail every handler above falls through or jumps to): call render_frame (redraws whatever got marked dirty), call edit_compute_row_col, reposition the hardware cursor via tty_raw_cursor_to(cursor_row+1, cursor_col+1), jmp edit_main_loop. Every `cmp reg, imm` immediate here is a byte value, a small dir code, a fixed row/col bound (24 or 255), or a fixed literal length (31). No test mnemonic. No 2-op imul. No neg. No sil/dil/bl. All labels prefixed edit_.",
       block: {
         sub rsp, 8;
 
@@ -467,6 +694,9 @@ module Editor = structure {
         mov rax, [rcx];
         add rax, 1;
         mov [rcx], rax;
+        lea rcx, [rip + edit_dirty];
+        mov rax, 1;
+        mov [rcx], rax;
         call edit_compute_row_col;
         lea rcx, [rip + cursor_row];
         mov rdi, [rcx];
@@ -483,6 +713,9 @@ module Editor = structure {
         lea rcx, [rip + cursor_pos];
         mov rax, [rcx];
         add rax, 1;
+        mov [rcx], rax;
+        lea rcx, [rip + edit_dirty];
+        mov rax, 1;
         mov [rcx], rax;
         call edit_compute_row_col;
         lea rcx, [rip + cursor_row];
@@ -511,6 +744,9 @@ module Editor = structure {
         call buf_delete;
         lea rcx, [rip + cursor_pos];
         mov [rcx], rbx;
+        lea rcx, [rip + edit_dirty];
+        mov rax, 1;
+        mov [rcx], rax;
         lea rcx, [rip + _edit_key_buf];
         xor r12, r12;
         mov_b r12, [rcx];
@@ -533,41 +769,11 @@ module Editor = structure {
         jmp edit_after_dispatch;
 
       edit_handle_save:
-        lea rcx, [rip + edit_filename_len];
-        mov rax, [rcx];
-        cmp rax, 0;
-        je edit_after_dispatch;
-        lea rdi, [rip + _edit_filename];
-        mov rsi, 0xC1;
-        mov rdx, 0x1A4;
-        mov rax, 2;
-        syscall;
-        cmp rax, 0;
-        jl edit_after_dispatch;
-        mov rbx, rax;
-        call buf_normalize;
-        lea rsi, [rip + _edit_buf];
-        lea rcx, [rip + total_len];
-        mov rdx, [rcx];
-        mov rdi, rbx;
-        mov rax, 1;
-        syscall;
-        mov rdi, rbx;
-        mov rax, 3;
-        syscall;
+        call edit_do_save;
         jmp edit_after_dispatch;
 
       edit_handle_load:
-        lea rcx, [rip + edit_filename_len];
-        mov rax, [rcx];
-        cmp rax, 0;
-        je edit_after_dispatch;
-        call buf_reset;
-        call edit_load_file;
-        lea rcx, [rip + cursor_pos];
-        xor rax, rax;
-        mov [rcx], rax;
-        call render_reset;
+        call edit_do_load_current;
         jmp edit_after_dispatch;
 
       edit_handle_esc:
@@ -582,7 +788,12 @@ module Editor = structure {
         xor rax, rax;
         mov_b rax, [rcx];
         cmp rax, 0x5B;
-        jne edit_after_dispatch;
+        je edit_esc_arrow;
+        cmp rax, 0x3A;
+        je edit_cmdline_enter;
+        jmp edit_after_dispatch;
+
+      edit_esc_arrow:
         xor rdi, rdi;
         lea rsi, [rip + _edit_key_buf];
         mov rdx, 1;
@@ -615,7 +826,133 @@ module Editor = structure {
         call edit_cursor_move;
         jmp edit_after_dispatch;
 
+      // -- edit#6: modal command line (entered on ESC then ':') ----------
+      edit_cmdline_enter:
+        lea rcx, [rip + edit_cmd_len];
+        xor rax, rax;
+        mov [rcx], rax;
+
+      edit_cmdline_loop:
+        xor rdi, rdi;
+        lea rsi, [rip + _edit_key_buf];
+        mov rdx, 1;
+        xor rax, rax;
+        syscall;
+        cmp rax, 1;
+        jne edit_cmdline_loop;
+
+        lea rcx, [rip + _edit_key_buf];
+        xor rax, rax;
+        mov_b rax, [rcx];
+
+        cmp rax, 0x0D;
+        je edit_cmdline_dispatch;
+        cmp rax, 0x0A;
+        je edit_cmdline_dispatch;
+        cmp rax, 0x1B;
+        je edit_after_dispatch;
+        cmp rax, 0x7F;
+        je edit_cmdline_bs;
+        cmp rax, 0x08;
+        je edit_cmdline_bs;
+
+        lea rcx, [rip + edit_cmd_len];
+        mov r9, [rcx];
+        cmp r9, 255;
+        jge edit_cmdline_loop;
+        lea r8, [rip + _edit_cmd_buf];
+        mov_b [r8 + r9*1], rax;
+        add r9, 1;
+        mov [rcx], r9;
+        jmp edit_cmdline_loop;
+
+      edit_cmdline_bs:
+        lea rcx, [rip + edit_cmd_len];
+        mov r9, [rcx];
+        cmp r9, 0;
+        je edit_cmdline_loop;
+        sub r9, 1;
+        mov [rcx], r9;
+        jmp edit_cmdline_loop;
+
+      edit_cmdline_dispatch:
+        lea rcx, [rip + edit_cmd_len];
+        mov rax, [rcx];
+
+        cmp rax, 1;
+        je edit_cmdline_single;
+        cmp rax, 2;
+        je edit_cmdline_wq;
+        cmp rax, 3;
+        jl edit_after_dispatch;
+
+        lea r8, [rip + _edit_cmd_buf];
+        xor rax, rax;
+        mov_b rax, [r8 + 0];
+        cmp rax, 0x65;
+        jne edit_after_dispatch;
+        xor rax, rax;
+        mov_b rax, [r8 + 1];
+        cmp rax, 0x20;
+        jne edit_after_dispatch;
+
+        lea rcx, [rip + edit_cmd_len];
+        mov r9, [rcx];
+        lea r8, [rip + _edit_cmd_buf];
+        xor rax, rax;
+        mov_b [r8 + r9*1], rax;
+
+        lea rdi, [rip + _edit_cmd_buf];
+        add rdi, 2;
+        call edit_set_filename;
+        call edit_do_load_current;
+        jmp edit_after_dispatch;
+
+      edit_cmdline_single:
+        lea r8, [rip + _edit_cmd_buf];
+        xor rax, rax;
+        mov_b rax, [r8 + 0];
+        cmp rax, 0x77;
+        je edit_cmdline_do_w;
+        cmp rax, 0x71;
+        je edit_quit;
+        jmp edit_after_dispatch;
+
+      edit_cmdline_do_w:
+        call edit_do_save;
+        jmp edit_after_dispatch;
+
+      edit_cmdline_wq:
+        lea r8, [rip + _edit_cmd_buf];
+        xor rax, rax;
+        mov_b rax, [r8 + 0];
+        cmp rax, 0x77;
+        jne edit_after_dispatch;
+        xor rax, rax;
+        mov_b rax, [r8 + 1];
+        cmp rax, 0x71;
+        jne edit_after_dispatch;
+        call edit_do_save;
+        jmp edit_quit;
+
       edit_quit:
+        lea rcx, [rip + edit_dirty];
+        mov rax, [rcx];
+        cmp rax, 0;
+        je edit_quit_clean;
+        mov rdi, 2;
+        lea rsi, [rip + edit_exit_msg_1];
+        mov rdx, 31;
+        mov rax, 1;
+        syscall;
+        jmp edit_quit_restore;
+      edit_quit_clean:
+        mov rdi, 2;
+        lea rsi, [rip + edit_exit_msg_0];
+        mov rdx, 31;
+        mov rax, 1;
+        syscall;
+      edit_quit_restore:
         call edit_tty_raw_exit;
         xor rdi, rdi;
         mov rax, 60;

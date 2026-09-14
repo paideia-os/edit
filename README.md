@@ -50,10 +50,11 @@ raw keystroke at a time from fd 0 and dispatches on it —
 | Backspace / DEL | delete the byte before the cursor |
 | Enter (CR/LF) | insert a newline |
 | Arrow keys | move the cursor (see below) |
-| Ctrl+S | save to the current path |
+| Ctrl+S | save to the current path (fingerprint: `edit ok -- file=<path> bytes=<N>`) |
 | Ctrl+O | discard changes, reload the current path |
-| Ctrl+Q | quit (restores the primary screen first) |
-| ESC | reserved for command mode — **deferred to a later milestone** |
+| Ctrl+Q | quit (fingerprint: `edit exit -- unsaved-changes=<0\|1>`, then restores the primary screen) |
+| ESC `:` | enter the colon command line (see below) |
+| ESC (anything else) | no-op |
 
 Arrow keys arrive as the 3-byte ANSI sequence `ESC [ <A/B/C/D>`; `edit`
 recognizes that shape inline in its ESC handler and dispatches to
@@ -62,20 +63,42 @@ to the buffer's extent. Up/Down jump to the **start** of the previous/next
 logical line — a deliberate M1 simplification; they do not yet preserve the
 visual column.
 
-A bare ESC (not followed by `[`) is meant to open a `:`-style command line
-(`:w`, `:q`, `:wq`, `:e <file>`) — that mode is explicitly out of scope for
-this cohort and is a no-op today. Because of that deferral, **Ctrl+Q is an
-M1-only addition** so the process has some way to exit and restore the
-terminal; it is not part of the eventual command-mode design and may be
-retired once `:q` lands.
+**Colon command line (edit#6).** Pressing ESC then `:` opens a command
+line: `edit` reads further bytes into a small buffer (256-byte cap) until
+Enter, and dispatches on the collected text:
 
-## Known M1 limitations
+| Command | Effect |
+|---|---|
+| `w` | save to the current path (same as Ctrl+S) |
+| `q` | quit (same as Ctrl+Q) |
+| `wq` | save, then quit |
+| `e <path>` | retarget the working file to `<path>` and load it, discarding unsaved changes (same best-effort missing-file posture as startup) |
+
+Pressing ESC again while collecting a command cancels it (discards the
+partial text, no-op). An unrecognised command (including an empty one —
+Enter pressed immediately after `:`) is silently ignored. `Ctrl+Q` remains
+available alongside `:q` — both paths share one quit sequence and one exit
+fingerprint.
+
+**Fingerprints (edit#7).** Two `stderr` (fd 2) lines exist for automated
+verification / logs:
+
+- `edit ok -- file=<path> bytes=<N>\n` — written on every successful save
+  (Ctrl+S, `:w`, or `:wq`'s save half), `<path>` is the current filename
+  and `<N>` the decimal byte count written.
+- `edit exit -- unsaved-changes=<0|1>\n` — written on every quit (Ctrl+Q,
+  `:q`, `:wq`), `1` if the buffer has been modified since the last
+  successful save or load and `0` otherwise.
+
+## Known M1/M1-006/M1-007 limitations
 
 - 64 KiB buffer cap (gap buffer, not a piece-table).
 - No scrolling — only the first 24 lines of a file are ever shown.
-- No command-mode / ex-commands (`:w`, `:q`, `:wq`, `:e`) — Ctrl+S / Ctrl+O
-  stand in for save/reload against the one path set at startup.
 - Up/Down cursor motion does not preserve the visual column.
+- `:e <path>` widens `edit`'s file capability from an argv-narrowed path
+  to an unnarrowed one (see `caps.decl`'s own note) — there is no
+  mid-process cap-renarrowing primitive in this codebase yet to scope it
+  back down per-command.
 - No raw-mode ICANON/ECHO toggle at the kernel side — `edit` writes ANSI
   control sequences to fd 1 but relies on the terminal's own line
   discipline for fd 0 reads, same open substrate gap shell's own line

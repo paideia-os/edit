@@ -2,9 +2,39 @@
 
 Every edit release follows semver. The 0.5.0 line closes R71.M1 (edit#1
 through edit#5): repo bootstrap, raw-mode alt-screen TTY, the gap-buffer
-model, dirty-line rendering, and basic modeless editing.
+model, dirty-line rendering, and basic modeless editing. The 0.6.0 line
+adds the modal command line and connection/save fingerprints (edit#6,
+edit#7).
 
 ---
+
+## v0.6.0 — 2026-09-13 (Wave HHH: edit#6, edit#7)
+
+### Closed
+
+- **edit#6 (R71.M1-006) — modal command line.** `src/editor.pdx`: ESC
+  followed by `:` now enters a colon-command line (the deferred bare-ESC
+  hook edit#5 reserved). Reads bytes into `_edit_cmd_buf` (256-byte cap)
+  until Enter; ESC while collecting cancels. Recognizes `w` (save),
+  `q` (quit), `wq` (save then quit), and `e <path>` (retarget the
+  editor's working file to `<path>` and load it, discarding unsaved
+  changes — same best-effort missing-file posture as startup/Ctrl+O).
+  The Ctrl+S and Ctrl+O keybindings are refactored into two new
+  callables, `edit_do_save` and `edit_do_load_current`, shared by both
+  the control-key and colon-command paths. **caps.decl**: `KIND_PDXFS_
+  FILE (read/write)` narrowing dropped from `<arg-path>` to unnarrowed —
+  `:e <path>` lets the editor open any path chosen interactively at
+  runtime, not just argv[1] (see caps.decl's own note on why this is
+  the right shape for an interactive tool vs. cat/cp's batch-argv
+  narrowing).
+
+- **edit#7 (R71.M1-007) — save/quit fingerprints.** `edit_do_save` emits
+  `edit ok -- file=<path> bytes=<N>\n` to fd 2 on a successful save
+  (Ctrl+S or `:w`/`:wq`), reusing `TtyRaw::ttyr_emit_dec` for the
+  decimal byte count. `edit_quit` emits `edit exit -- unsaved-
+  changes=<0|1>\n` to fd 2 on every quit path (Ctrl+Q, `:q`, `:wq`),
+  reflecting a new `edit_dirty` flag set by every successful
+  insert/enter/backspace and cleared by a successful save or load.
 
 ## v0.5.0 — 2026-09-13 (Wave KK: edit#1, edit#2, edit#3, edit#4, edit#5 — M1 close)
 
